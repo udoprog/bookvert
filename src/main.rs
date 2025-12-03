@@ -330,6 +330,26 @@ impl Picker {
     }
 }
 
+/// Accepted image file extensions.
+macro_rules! ext {
+    () => {
+        "jpg" | "png" | "gif" | "bmp" | "tif" | "webp" | "avif"
+    };
+}
+
+/// Translates certain extensions to their more common forms.
+fn translate(input: &str) -> &str {
+    if input.eq_ignore_ascii_case("jpeg") {
+        return "jpg";
+    }
+
+    if input.eq_ignore_ascii_case("tiff") {
+        return "tif";
+    }
+
+    input
+}
+
 fn main() -> Result<()> {
     let mut warn: ColorSpec = ColorSpec::new();
     warn.set_fg(Some(termcolor::Color::Yellow));
@@ -368,7 +388,23 @@ fn main() -> Result<()> {
             };
 
             if ty.is_file() {
-                files.push(entry.into_path());
+                let path = entry.into_path();
+
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(translate)
+                    .map(|e| e.to_lowercase());
+
+                let Some(ext) = ext else {
+                    continue;
+                };
+
+                if !matches!(ext.as_str(), ext!()) {
+                    continue;
+                }
+
+                files.push((path, ext));
             }
         }
     }
@@ -377,7 +413,7 @@ fn main() -> Result<()> {
 
     let mut books_by_path = BTreeMap::<&Path, Book<'_>>::new();
 
-    for from in &files {
+    for (from, ext) in &files {
         let Some(path) = from.parent() else {
             continue;
         };
@@ -392,12 +428,6 @@ fn main() -> Result<()> {
             pages: Vec::new(),
             numbers: numbers(name).collect(),
         });
-
-        let Some(ext) = from.extension() else {
-            continue;
-        };
-
-        let ext = ext.to_string_lossy().to_lowercase();
 
         book.pages.push(Page {
             path: from.clone(),
