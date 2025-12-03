@@ -9,7 +9,7 @@ use core::str::FromStr;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, Metadata};
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -59,6 +59,9 @@ struct Opts {
     /// Specify a regular expression for a name to skip.
     #[arg(long)]
     skip: Vec<String>,
+    /// Only include series numbers matching these predicates.
+    #[arg(long)]
+    include: Vec<From>,
     /// Series for ComicInfo.xml metadata.
     #[arg(long)]
     series: Option<String>,
@@ -119,17 +122,33 @@ impl fmt::Display for Manga {
     }
 }
 
+struct Page {
+    path: PathBuf,
+    name: String,
+    metadata: Metadata,
+}
+
 struct Book<'a> {
     path: &'a Path,
     name: &'a str,
-    pages: Vec<(PathBuf, String)>,
+    pages: Vec<Page>,
     numbers: BTreeSet<u32>,
+}
+
+impl Book<'_> {
+    /// Returns the total size of all pages in bytes.
+    #[inline]
+    fn bytes(&self) -> u64 {
+        self.pages.iter().map(|page| page.metadata.len()).sum()
+    }
 }
 
 enum To {
     First,
     Last,
     MostPages,
+    Largest,
+    Smallest,
     Index(usize),
 }
 
@@ -140,6 +159,8 @@ impl To {
             To::First => books.first().copied(),
             To::Last => books.last().copied(),
             To::MostPages => books.iter().max_by_key(|book| book.pages.len()).copied(),
+            To::Largest => books.iter().max_by_key(|book| book.bytes()).copied(),
+            To::Smallest => books.iter().min_by_key(|book| book.bytes()).copied(),
             To::Index(n) => books.get(*n).copied(),
         }
     }
@@ -154,6 +175,8 @@ impl FromStr for To {
             "first" => Ok(To::First),
             "last" => Ok(To::Last),
             "most-pages" => Ok(To::MostPages),
+            "largest" => Ok(To::Largest),
+            "smallest" => Ok(To::Smallest),
             _ => {
                 let n: usize = s
                     .parse()
@@ -171,17 +194,22 @@ impl fmt::Display for To {
             To::First => write!(f, "first"),
             To::Last => write!(f, "last"),
             To::MostPages => write!(f, "most-pages"),
+            To::Largest => write!(f, "largest"),
+            To::Smallest => write!(f, "smallest"),
             To::Index(n) => n.fmt(f),
         }
     }
 }
 
+#[derive(Clone)]
 enum From {
     Full,
     Single(u32),
     RangeInclusive(u32, u32),
     Range(u32, u32),
     RangeOpen(u32),
+    RangeTo(u32),
+    RangeToInclusive(u32),
 }
 
 impl From {
@@ -193,6 +221,8 @@ impl From {
             From::RangeInclusive(start, end) => (start..=end).contains(&number),
             From::Range(start, end) => (start..end).contains(&number),
             From::RangeOpen(start) => (start..).contains(&number),
+            From::RangeTo(end) => (..end).contains(&number),
+            From::RangeToInclusive(end) => (..=end).contains(&number),
         }
     }
 }
@@ -204,19 +234,33 @@ impl FromStr for From {
     fn from_str(s: &str) -> Result<Self> {
         let s = s.trim();
 
-        if s == ".." {
-            return Ok(From::Full);
-        }
-
         if let Some((from, to)) = s.split_once("..=") {
-            let from = from.trim().parse()?;
+            let from = from.trim();
+
+            if from.is_empty() {
+                let to = to.trim().parse()?;
+                return Ok(From::RangeToInclusive(to));
+            }
+
+            let from = from.parse()?;
             let to = to.trim().parse()?;
             return Ok(From::RangeInclusive(from, to));
         };
 
         if let Some((from, to)) = s.split_once("..") {
-            let from = from.trim().parse()?;
+            let from = from.trim();
             let to = to.trim();
+
+            if from.is_empty() {
+                if to.is_empty() {
+                    return Ok(From::Full);
+                }
+
+                let to = to.parse()?;
+                return Ok(From::RangeTo(to));
+            }
+
+            let from = from.parse()?;
 
             if to.is_empty() {
                 return Ok(From::RangeOpen(from));
@@ -355,8 +399,12 @@ fn main() -> Result<()> {
 
         let ext = ext.to_string_lossy().to_lowercase();
 
-        let page = format!("p{:03}.{ext}", book.pages.len());
-        book.pages.push((from.clone(), page));
+        book.pages.push(Page {
+            path: from.clone(),
+            name: format!("p{:03}.{ext}", book.pages.len()),
+            metadata: fs::metadata(from)
+                .with_context(|| anyhow!("{}: Failed to get metadata", from.display()))?,
+        });
     }
 
     if !skip.is_empty() {
@@ -409,6 +457,10 @@ fn main() -> Result<()> {
     for (number, books) in &by_number {
         let number = *number;
 
+        if !opts.include.is_empty() && !opts.include.iter().any(|to| to.matches(number)) {
+            continue;
+        }
+
         let Some(book) = picker.pick(number, books) else {
             o.set_color(&error)?;
             write!(o, "[error] ")?;
@@ -416,15 +468,16 @@ fn main() -> Result<()> {
 
             writeln!(
                 o,
-                "{number:03}: more than one match, use -p like `-p most-pages`"
+                "{number:03}: more than one match, use something like `-p {number}=0` to pick one:",
             )?;
 
             for (index, book) in books.iter().enumerate() {
                 writeln!(
                     o,
-                    "  {index}: {} ({}P)",
+                    "  {index}: {} ({} pages, {} bytes)",
                     escape(book.name),
-                    book.pages.len()
+                    book.pages.len(),
+                    book.bytes(),
                 )?;
             }
 
@@ -438,10 +491,8 @@ fn main() -> Result<()> {
     ensure!(errors == 0, "Aborting due to previous issues.");
 
     for (number, book) in picked {
-        let title = format!("{name}{number}");
-
         let mut target = opts.out.clone();
-        target.push(&title);
+        target.push(format!("{name}{number:03}"));
         target.add_extension("cbz");
 
         let color = if opts.dry_run { &warn } else { &ok };
@@ -451,7 +502,7 @@ fn main() -> Result<()> {
 
         writeln!(o, " {number:03}: {}", book.path.display())?;
 
-        let comic_info = config_info(&opts, &name, &title, number, book.pages.len())
+        let comic_info = config_info(&opts, &name, number, book.pages.len())
             .context("ComicInfo.xml generation")?;
 
         if opts.verbose {
@@ -482,11 +533,11 @@ fn main() -> Result<()> {
         w.start_file("ComicInfo.xml", options)?;
         w.write_all(comic_info.as_bytes())?;
 
-        for (from, name) in book.pages.iter() {
-            let content = fs::read(from)
-                .with_context(|| anyhow!("Failed to read file {}", from.display()))?;
+        for page in book.pages.iter() {
+            let content = fs::read(&page.path)
+                .with_context(|| anyhow!("Failed to read file {}", page.path.display()))?;
 
-            w.start_file(name, options)?;
+            w.start_file(&page.name, options)?;
             w.write_all(&content)?;
         }
 
@@ -539,13 +590,7 @@ fn numbers(mut input: &str) -> impl Iterator<Item = u32> {
 }
 
 /// Generates ComicInfo.xml content if any metadata options are provided.
-fn config_info(
-    opts: &Opts,
-    name: &str,
-    title: &str,
-    number: u32,
-    page_count: usize,
-) -> Result<String> {
+fn config_info(opts: &Opts, name: &str, number: u32, page_count: usize) -> Result<String> {
     let mut o = String::new();
 
     writeln!(o, "<?xml version=\"1.0\" encoding=\"utf-8\"?>")?;
@@ -554,7 +599,11 @@ fn config_info(
         "<ComicInfo xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">"
     )?;
 
-    writeln!(o, "  <Title>{}</Title>", xml_escape(title))?;
+    writeln!(
+        o,
+        "  <Title>{}</Title>",
+        xml_escape(&format!("{name}{number}"))
+    )?;
 
     let series = opts.series.as_deref().unwrap_or(name);
     writeln!(o, "  <Series>{}</Series>", xml_escape(series))?;
