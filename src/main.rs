@@ -3,11 +3,12 @@
 //! This is a .cbz batch conversion tool which scans directories for image
 //! files, groups them by their directory and creates books out of them.
 
+use core::fmt::{self, Write as _};
+use core::iter;
 use core::str::FromStr;
-use core::{fmt, iter};
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ use zip::{CompressionMethod, ZipWriter};
 
 /// Helper tool to batch convert files into a .cbr
 #[derive(Parser)]
-#[command(about, version)]
+#[command(about, version, max_term_width = 80)]
 struct Opts {
     /// Output directory to write to.
     #[arg(long, default_value = ".")]
@@ -34,9 +35,17 @@ struct Opts {
     name: Option<String>,
     /// When there are more than one book, specify a predicate for how to pick.
     ///
-    /// Format: `[from=]to` where `from` is an optional book number to match,
-    /// and `to` is one of `first`, `last`, or an exact index (0-based).
-    #[arg(long, short = 'p')]
+    /// Format: `[from=]to` where `from` is an book number or range to match.
+    ///
+    /// The range in `from` is specified as `n..m` (exclusive), `n..=m` (inclusive), or `n..` (open-ended) or `..` (all).
+    /// The `to` target can be `first`, `last`, `most-pages`, or a zero-based index for the exact match to pick.
+    ///
+    /// Examples:
+    /// - `-p most-pages` picks the match with the most pages for all books.
+    /// - `-p 3=first` picks the first match for book number 3.
+    /// - `-p 3=1` picks the second match for book number 3.
+    /// - `-p 1..=5=most-pages` picks the match with the most pages for books 1 through 5.
+    #[arg(long, short = 'p', verbatim_doc_comment)]
     pick: Vec<String>,
     /// Overwrite existing files.
     #[arg(long, short = 'f')]
@@ -101,7 +110,7 @@ impl FromStr for Manga {
 
 impl fmt::Display for Manga {
     #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Manga::Yes => write!(f, "Yes"),
             Manga::No => write!(f, "No"),
@@ -120,7 +129,8 @@ struct Book<'a> {
 enum To {
     First,
     Last,
-    Exact(usize),
+    MostPages,
+    Index(usize),
 }
 
 impl To {
@@ -129,7 +139,8 @@ impl To {
         match self {
             To::First => books.first().copied(),
             To::Last => books.last().copied(),
-            To::Exact(n) => books.get(*n).copied(),
+            To::MostPages => books.iter().max_by_key(|book| book.pages.len()).copied(),
+            To::Index(n) => books.get(*n).copied(),
         }
     }
 }
@@ -142,11 +153,12 @@ impl FromStr for To {
         match s {
             "first" => Ok(To::First),
             "last" => Ok(To::Last),
+            "most-pages" => Ok(To::MostPages),
             _ => {
                 let n: usize = s
                     .parse()
                     .with_context(|| anyhow!("Parsing pick target '{}'", s))?;
-                Ok(To::Exact(n))
+                Ok(To::Index(n))
             }
         }
     }
@@ -154,11 +166,12 @@ impl FromStr for To {
 
 impl fmt::Display for To {
     #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             To::First => write!(f, "first"),
             To::Last => write!(f, "last"),
-            To::Exact(n) => write!(f, "{}", n),
+            To::MostPages => write!(f, "most-pages"),
+            To::Index(n) => n.fmt(f),
         }
     }
 }
@@ -401,16 +414,18 @@ fn main() -> Result<()> {
             write!(o, "[error] ")?;
             o.reset()?;
 
-            writeln!(o, "{number:03}: more than one match, use -p")?;
+            writeln!(
+                o,
+                "{number:03}: more than one match, use -p like `-p most-pages`"
+            )?;
 
             for (index, book) in books.iter().enumerate() {
-                let pick = match index {
-                    0 => To::First,
-                    n if n + 1 == books.len() => To::Last,
-                    n => To::Exact(n),
-                };
-
-                writeln!(o, "  `-p {number}={pick}`: {}", book.path.display())?;
+                writeln!(
+                    o,
+                    "  {index}: {} ({}P)",
+                    escape(book.name),
+                    book.pages.len()
+                )?;
             }
 
             errors += 1;
