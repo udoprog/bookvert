@@ -7,13 +7,15 @@ use core::str::FromStr;
 use core::{fmt, iter};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::Parser;
 use ignore::Walk;
+use language_tags::LanguageTag;
 use regex::Regex;
 use termcolor::{ColorSpec, WriteColor};
 use zip::write::SimpleFileOptions;
@@ -30,29 +32,82 @@ struct Opts {
     /// a series. Otherwise the directory name will be used.
     #[arg(long)]
     name: Option<String>,
-    /// Overwrite existing files.
-    #[arg(long)]
-    force: bool,
-    /// Perform a trial run with no changes made.
-    #[arg(long)]
-    dry_run: bool,
-    /// Specify a regular expression for a name to skip.
-    #[arg(long)]
-    skip: Vec<String>,
-    /// Start numbering from this book when renaming.
-    #[arg(long, default_value_t = 1)]
-    start_book: usize,
-    /// Use the first book found in case of duplicates.
-    #[arg(long)]
-    first_book: bool,
     /// When there are more than one book, specify a predicate for how to pick.
     ///
     /// Format: `[from=]to` where `from` is an optional book number to match,
     /// and `to` is one of `first`, `last`, or an exact index (0-based).
     #[arg(long, short = 'p')]
     pick: Vec<String>,
+    /// Overwrite existing files.
+    #[arg(long, short = 'f')]
+    force: bool,
+    /// Verbose output.
+    #[arg(long, short = 'v')]
+    verbose: bool,
+    /// Perform a trial run with no changes made.
+    #[arg(long)]
+    dry_run: bool,
+    /// Specify a regular expression for a name to skip.
+    #[arg(long)]
+    skip: Vec<String>,
+    /// Series for ComicInfo.xml metadata.
+    #[arg(long)]
+    series: Option<String>,
+    /// Writer / Author for ComicInfo.xml metadata.
+    #[arg(long, alias = "writer")]
+    author: Option<String>,
+    /// Penciller for ComicInfo.xml metadata.
+    #[arg(long, alias = "penciller")]
+    artist: Option<String>,
+    /// Publisher for ComicInfo.xml metadata.
+    #[arg(long)]
+    publisher: Option<String>,
+    /// Genre for ComicInfo.xml metadata (comma-separated).
+    #[arg(long)]
+    genre: Option<String>,
+    /// Language ISO code for ComicInfo.xml metadata (e.g., "en", "ja").
+    #[arg(long)]
+    language: Option<LanguageTag>,
+    /// Manga reading direction: "Yes", "No", or "YesAndRightToLeft".
+    #[arg(long)]
+    manga: Option<Manga>,
+    /// Summary/description for ComicInfo.xml metadata.
+    #[arg(long)]
+    summary: Option<String>,
     /// Directories to convert.
     path: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Manga {
+    Yes,
+    No,
+    YesAndRightToLeft,
+}
+
+impl FromStr for Manga {
+    type Err = anyhow::Error;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "Yes" => Ok(Manga::Yes),
+            "No" => Ok(Manga::No),
+            "YesAndRightToLeft" => Ok(Manga::YesAndRightToLeft),
+            _ => Err(anyhow!("Invalid manga value '{}'", s)),
+        }
+    }
+}
+
+impl fmt::Display for Manga {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Manga::Yes => write!(f, "Yes"),
+            Manga::No => write!(f, "No"),
+            Manga::YesAndRightToLeft => write!(f, "YesAndRightToLeft"),
+        }
+    }
 }
 
 struct Book<'a> {
@@ -201,10 +256,10 @@ impl Picker {
         }
 
         for m in &self.matches {
-            if m.from.matches(number) {
-                if let Some(book) = m.to.pick(books) {
-                    return Some(book);
-                }
+            if m.from.matches(number)
+                && let Some(book) = m.to.pick(books)
+            {
+                return Some(book);
             }
         }
 
@@ -236,7 +291,7 @@ fn main() -> Result<()> {
 
     for predicate in &opts.pick {
         picker
-            .parse(&predicate)
+            .parse(predicate)
             .with_context(|| anyhow!("Parsing pick predicate '{}'", predicate))?;
     }
 
@@ -247,7 +302,7 @@ fn main() -> Result<()> {
 
     let mut files = Vec::new();
 
-    for path in opts.path {
+    for path in &opts.path {
         for p in Walk::new(path) {
             let entry = p?;
 
@@ -316,10 +371,10 @@ fn main() -> Result<()> {
 
         let mut it = names.iter();
 
-        if let Some(first) = it.next() {
-            if it.next().is_none() {
-                break 'name first.to_string();
-            }
+        if let Some(first) = it.next()
+            && it.next().is_none()
+        {
+            break 'name first.to_string();
         }
 
         o.set_color(&error)?;
@@ -329,7 +384,7 @@ fn main() -> Result<()> {
         writeln!(o, "Use `--name <name>` to set one name of the series:")?;
 
         for name in &names {
-            writeln!(o, "  {}", escape(&name))?;
+            writeln!(o, "  {}", escape(name))?;
         }
 
         bail!("Aborting due to previous issues.");
@@ -341,7 +396,7 @@ fn main() -> Result<()> {
     for (number, books) in &by_number {
         let number = *number;
 
-        let Some(book) = picker.pick(number, &books) else {
+        let Some(book) = picker.pick(number, books) else {
             o.set_color(&error)?;
             write!(o, "[error] ")?;
             o.reset()?;
@@ -368,8 +423,10 @@ fn main() -> Result<()> {
     ensure!(errors == 0, "Aborting due to previous issues.");
 
     for (number, book) in picked {
+        let title = format!("{name}{number}");
+
         let mut target = opts.out.clone();
-        target.push(format!("{name}{number}"));
+        target.push(&title);
         target.add_extension("cbz");
 
         let color = if opts.dry_run { &warn } else { &ok };
@@ -378,6 +435,20 @@ fn main() -> Result<()> {
         o.reset()?;
 
         writeln!(o, " {number:03}: {}", book.path.display())?;
+
+        let comic_info = config_info(&opts, &name, &title, number, book.pages.len())
+            .context("ComicInfo.xml generation")?;
+
+        if opts.verbose {
+            o.set_color(&ok)?;
+            write!(o, "  [info] ")?;
+            o.reset()?;
+            writeln!(o, "ComicInfo.xml:")?;
+
+            for line in comic_info.lines() {
+                writeln!(o, "    {line}")?;
+            }
+        }
 
         if target.exists() && !opts.force {
             o.set_color(&warn)?;
@@ -393,8 +464,11 @@ fn main() -> Result<()> {
             .compression_method(CompressionMethod::Stored)
             .unix_permissions(0o755);
 
+        w.start_file("ComicInfo.xml", options)?;
+        w.write_all(comic_info.as_bytes())?;
+
         for (from, name) in book.pages.iter() {
-            let content = fs::read(&from)
+            let content = fs::read(from)
                 .with_context(|| anyhow!("Failed to read file {}", from.display()))?;
 
             w.start_file(name, options)?;
@@ -449,6 +523,63 @@ fn numbers(mut input: &str) -> impl Iterator<Item = u32> {
     })
 }
 
+/// Generates ComicInfo.xml content if any metadata options are provided.
+fn config_info(
+    opts: &Opts,
+    name: &str,
+    title: &str,
+    number: u32,
+    page_count: usize,
+) -> Result<String> {
+    let mut o = String::new();
+
+    writeln!(o, "<?xml version=\"1.0\" encoding=\"utf-8\"?>")?;
+    writeln!(
+        o,
+        "<ComicInfo xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">"
+    )?;
+
+    writeln!(o, "  <Title>{}</Title>", xml_escape(title))?;
+
+    let series = opts.series.as_deref().unwrap_or(name);
+    writeln!(o, "  <Series>{}</Series>", xml_escape(series))?;
+
+    writeln!(o, "  <Number>{number}</Number>")?;
+    writeln!(o, "  <PageCount>{page_count}</PageCount>")?;
+
+    if let Some(author) = &opts.author {
+        writeln!(o, "  <Writer>{}</Writer>", xml_escape(author))?;
+    }
+
+    if let Some(artist) = &opts.artist {
+        writeln!(o, "  <Penciller>{}</Penciller>", xml_escape(artist))?;
+    }
+
+    if let Some(publisher) = &opts.publisher {
+        writeln!(o, "  <Publisher>{}</Publisher>", xml_escape(publisher))?;
+    }
+
+    if let Some(genre) = &opts.genre {
+        writeln!(o, "  <Genre>{}</Genre>", xml_escape(genre))?;
+    }
+
+    if let Some(language) = &opts.language {
+        writeln!(o, "  <LanguageISO>{language}</LanguageISO>")?;
+    }
+
+    if let Some(manga) = &opts.manga {
+        writeln!(o, "  <Manga>{manga}</Manga>")?;
+    }
+
+    if let Some(summary) = &opts.summary {
+        writeln!(o, "  <Summary>{}</Summary>", xml_escape(summary))?;
+    }
+
+    writeln!(o, "</ComicInfo>")?;
+    Ok(o)
+}
+
+/// Terminal escape.
 fn escape(input: &str) -> Cow<'_, str> {
     let mut escaped = String::new();
 
@@ -479,5 +610,37 @@ fn escape(input: &str) -> Cow<'_, str> {
     }
 
     escaped.push('"');
+    Cow::Owned(escaped)
+}
+
+/// Escapes special XML characters.
+fn xml_escape(input: &str) -> Cow<'_, str> {
+    let mut escaped = String::new();
+
+    let n = 'escape: {
+        for (n, c) in input.char_indices() {
+            if !matches!(c, '&' | '<' | '>' | '"' | '\'') {
+                continue;
+            }
+
+            break 'escape n;
+        }
+
+        return Cow::Borrowed(input);
+    };
+
+    escaped.push_str(&input[..n]);
+
+    for c in input[n..].chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            c => escaped.push(c),
+        }
+    }
+
     Cow::Owned(escaped)
 }
