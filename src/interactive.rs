@@ -1,24 +1,27 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
-use crate::Book;
+use crate::{Book, State};
 
-pub(crate) enum Outcome {
+pub(crate) enum Action {
     Picked(usize),
-    Unpicked(u32),
+    Unpick(usize),
     Quit,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Select {
     Choice(usize),
-    Picked(u32),
+    Picked(usize),
 }
 
 impl Default for Select {
@@ -32,6 +35,7 @@ impl Default for Select {
 pub(crate) struct Pick {
     select: Select,
     scroll_x: u16,
+    list_state: ListState,
     expanded: HashSet<usize>,
 }
 
@@ -40,25 +44,24 @@ impl Pick {
         &mut self,
         title: &str,
         books: &[&Book<'_>],
-        picked: &BTreeMap<u32, (&Book<'_>, Vec<&Book<'_>>)>,
-    ) -> Result<Outcome> {
+        state: &State<'_, '_>,
+    ) -> Result<Action> {
         self.expanded.clear();
         self.scroll_x = 0;
+        self.list_state = ListState::default();
 
         let last_choice = Select::Choice(books.len().saturating_sub(1));
 
         self.select = match self.select {
             Select::Choice(n) => Select::Choice(n.min(books.len().saturating_sub(1))),
-            Select::Picked(n) => match picked.contains_key(&n) {
-                true => Select::Picked(n),
-                false => last_choice,
-            },
+            Select::Picked(..) if state.picked.is_empty() => last_choice,
+            Select::Picked(n) => Select::Picked(n.min(state.picked.len().saturating_sub(1))),
         };
 
         let mut terminal = ratatui::init();
 
         let outcome = loop {
-            terminal.draw(|f| self.draw(title, books, picked, f))?;
+            terminal.draw(|f| self.draw(title, books, state, f))?;
             let e = event::read()?;
 
             match e {
@@ -66,25 +69,18 @@ impl Pick {
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.select = match self.select {
                             Select::Choice(n) => Select::Choice(n.saturating_sub(1)),
-                            Select::Picked(n) => match picked.range(..n).next_back() {
-                                Some((n, _)) => Select::Picked(*n),
-                                _ => last_choice,
-                            },
+                            Select::Picked(0) => last_choice,
+                            Select::Picked(n) => Select::Picked(n.saturating_sub(1)),
                         };
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.select = match self.select {
-                            Select::Choice(n) if n + 1 >= books.len() => {
-                                match picked.first_key_value() {
-                                    Some((n, _)) => Select::Picked(*n),
-                                    _ => last_choice,
-                                }
-                            }
+                            Select::Choice(n) if n + 1 >= books.len() => Select::Picked(0),
                             Select::Choice(n) => Select::Choice(n + 1),
-                            Select::Picked(n) => match picked.range(n..).nth(1) {
-                                Some((n, _)) => Select::Picked(*n),
-                                _ => Select::Picked(n),
-                            },
+                            Select::Picked(n) => Select::Picked(
+                                n.saturating_add(1)
+                                    .min(state.picked.len().saturating_sub(1)),
+                            ),
                         };
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
@@ -92,6 +88,13 @@ impl Pick {
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
                         self.scroll_x = self.scroll_x.saturating_add(4);
+                    }
+                    KeyCode::Char('O') => {
+                        if self.expanded.len() == books.len() {
+                            self.expanded.clear();
+                        } else {
+                            self.expanded.extend(0..books.len());
+                        }
                     }
                     KeyCode::Char('o' | ' ') => {
                         if let Select::Choice(index) = self.select {
@@ -104,11 +107,11 @@ impl Pick {
                     }
                     KeyCode::Enter => {
                         break match self.select {
-                            Select::Choice(n) => Outcome::Picked(n),
-                            Select::Picked(n) => Outcome::Unpicked(n),
+                            Select::Choice(n) => Action::Picked(n),
+                            Select::Picked(n) => Action::Unpick(n),
                         };
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => break Outcome::Quit,
+                    KeyCode::Esc | KeyCode::Char('q') => break Action::Quit,
                     _ => {}
                 },
                 _ => {}
@@ -119,35 +122,18 @@ impl Pick {
         Ok(outcome)
     }
 
-    fn draw(
-        &mut self,
-        title: &str,
-        books: &[&Book<'_>],
-        picked: &BTreeMap<u32, (&Book<'_>, Vec<&Book<'_>>)>,
-        frame: &mut Frame,
-    ) {
-        let area = frame.area();
+    fn draw(&mut self, title: &str, books: &[&Book<'_>], state: &State<'_, '_>, frame: &mut Frame) {
+        let mut items = Vec::new();
+        let mut selected = None;
 
-        let start_y = area.y;
+        for (i, book) in books.iter().enumerate() {
+            let is_selected = self.select == Select::Choice(i);
 
-        // Render the title
-        let title_line = Line::from(Span::styled(title, Style::default().fg(Color::Cyan).bold()));
+            if is_selected {
+                selected = Some(items.len());
+            }
 
-        frame.render_widget(
-            Paragraph::new(title_line).scroll((0, self.scroll_x)),
-            ratatui::layout::Rect {
-                x: area.x,
-                y: start_y,
-                width: area.width,
-                height: 1,
-            },
-        );
-
-        // Render the list of choices
-        let mut current_y = start_y + 1;
-
-        for (index, book) in books.iter().enumerate() {
-            let (prefix, style) = if self.select == Select::Choice(index) {
+            let (prefix, style) = if self.select == Select::Choice(i) {
                 (
                     "* ",
                     Style::default()
@@ -171,60 +157,39 @@ impl Pick {
                 ),
             ]);
 
-            frame.render_widget(
-                Paragraph::new(line).scroll((0, self.scroll_x)),
-                ratatui::layout::Rect {
-                    x: area.x,
-                    y: current_y,
-                    width: area.width,
-                    height: 1,
-                },
-            );
-            current_y += 1;
+            items.push(ListItem::new(line));
 
-            if self.expanded.contains(&index) {
-                if let Some(book) = books.get(index) {
-                    let path_line = Line::from(Span::styled(
-                        format!("    {}", book.dir.display()),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-
-                    frame.render_widget(
-                        Paragraph::new(path_line).scroll((0, self.scroll_x)),
-                        ratatui::layout::Rect {
-                            x: area.x,
-                            y: current_y,
-                            width: area.width,
-                            height: 1,
-                        },
-                    );
-                    current_y += 1;
-                }
+            if self.expanded.contains(&i) {
+                let path_line = Line::from(Span::styled(
+                    format!("    {}", book.dir.display()),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                items.push(ListItem::new(path_line));
             }
         }
 
-        // Render the list of already picked choices
-        if !picked.is_empty() {
-            current_y += 1; // Add a blank line
-
-            let picked_title = Line::from(Span::styled(
-                "Already picked:",
+        if !state.picked.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "Picked:",
                 Style::default().fg(Color::DarkGray).bold(),
-            ));
+            ))));
 
-            frame.render_widget(
-                Paragraph::new(picked_title),
-                ratatui::layout::Rect {
-                    x: area.x,
-                    y: current_y,
-                    width: area.width,
-                    height: 1,
-                },
-            );
-            current_y += 1;
+            for (i, (c, n)) in state.picked.iter().enumerate() {
+                let Some((catalog, book)) = state
+                    .catalogs
+                    .get(*c)
+                    .and_then(|c| Some((c, c.books.get(*n)?)))
+                else {
+                    continue;
+                };
 
-            for (i, (n, (book, _))) in picked.iter().enumerate() {
-                let (prefix, style) = if self.select == Select::Picked(*n) {
+                let is_selected = self.select == Select::Picked(i);
+
+                if is_selected {
+                    selected = Some(items.len());
+                }
+
+                let (prefix, style) = if is_selected {
                     (
                         "* ",
                         Style::default()
@@ -232,31 +197,41 @@ impl Pick {
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    ("  ", Style::default().fg(Color::DarkGray))
+                    ("  ", Style::default())
                 };
 
                 let line = Line::from(Span::styled(
                     format!(
-                        "{}{}: {} ({} pages, {} bytes)",
-                        prefix,
-                        n,
+                        "{prefix}{number}: {} ({} pages, {} bytes)",
                         book.name,
                         book.pages.len(),
-                        book.bytes()
+                        book.bytes(),
+                        number = catalog.number,
                     ),
                     style,
                 ));
-
-                frame.render_widget(
-                    Paragraph::new(line).scroll((0, self.scroll_x)),
-                    ratatui::layout::Rect {
-                        x: area.x,
-                        y: current_y + i as u16,
-                        width: area.width,
-                        height: 1,
-                    },
-                );
+                items.push(ListItem::new(line));
             }
         }
+
+        self.list_state.select(selected);
+
+        let mut scrollbar_state = ScrollbarState::new(items.len())
+            .position(self.list_state.selected().unwrap_or_default());
+
+        let area = frame.area();
+        let layout = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+
+        let title_line = Line::from(Span::styled(title, Style::default().fg(Color::Cyan).bold()));
+        frame.render_widget(
+            Paragraph::new(title_line).scroll((0, self.scroll_x)),
+            layout[0],
+        );
+
+        let list = List::new(items);
+        frame.render_stateful_widget(list, layout[1], &mut self.list_state);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(scrollbar, layout[1], &mut scrollbar_state);
     }
 }

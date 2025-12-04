@@ -22,9 +22,33 @@ use termcolor::{ColorSpec, WriteColor};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-use crate::interactive::Outcome;
+use crate::interactive::Action;
 
 mod interactive;
+
+struct Catalog<'book, 'a> {
+    number: u32,
+    books: Vec<&'book Book<'a>>,
+}
+
+#[derive(Default)]
+struct State<'book, 'a> {
+    catalogs: Vec<Catalog<'book, 'a>>,
+    picked: BTreeMap<usize, usize>,
+}
+
+impl<'book, 'a> State<'book, 'a> {
+    /// Returns the next unpicked book number, or None if all are picked.
+    fn next_unpicked(&self) -> Option<(usize, &Catalog<'book, 'a>)> {
+        for (index, catalog) in self.catalogs.iter().enumerate() {
+            if !self.picked.contains_key(&index) {
+                return Some((index, catalog));
+            }
+        }
+
+        None
+    }
+}
 
 /// Helper tool to batch convert files into a .cbr
 #[derive(Parser)]
@@ -162,15 +186,32 @@ enum To {
 
 impl To {
     /// Picks a book from the list according to the strategy.
-    fn pick<'book, 'a>(&self, books: &[&'book Book<'a>]) -> Option<&'book Book<'a>> {
-        match self {
-            To::First => books.first().copied(),
-            To::Last => books.last().copied(),
-            To::MostPages => books.iter().max_by_key(|book| book.pages.len()).copied(),
-            To::Largest => books.iter().max_by_key(|book| book.bytes()).copied(),
-            To::Smallest => books.iter().min_by_key(|book| book.bytes()).copied(),
-            To::Index(n) => books.get(*n).copied(),
-            To::Regex(re) => books.iter().find(|book| re.is_match(book.name)).copied(),
+    fn pick(&self, books: &[&Book<'_>]) -> Option<usize> {
+        match *self {
+            To::First if !books.is_empty() => Some(0),
+            To::Last => books.len().checked_sub(1),
+            To::MostPages => books
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, b)| b.pages.len())
+                .map(|(i, _)| i),
+            To::Largest => books
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, b)| b.bytes())
+                .map(|(i, _)| i),
+            To::Smallest => books
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, b)| b.bytes())
+                .map(|(i, _)| i),
+            To::Index(n) if n < books.len() => Some(n),
+            To::Regex(ref re) => books
+                .iter()
+                .enumerate()
+                .find(|(_, book)| re.is_match(book.name))
+                .map(|(i, _)| i),
+            _ => None,
         }
     }
 }
@@ -318,22 +359,18 @@ impl Picker {
     }
 
     /// Returns the index of the book to pick, or None if no predicate matched.
-    fn pick<'book, 'a>(&self, number: u32, books: &[&'book Book<'a>]) -> Option<&'book Book<'a>> {
-        if let [book] = books {
-            return Some(*book);
-        }
-
+    fn pick(&self, catalog: &Catalog<'_, '_>) -> Option<usize> {
         for m in &self.matches {
-            if m.from.matches(number)
-                && let Some(book) = m.to.pick(books)
+            if m.from.matches(catalog.number)
+                && let Some(index) = m.to.pick(&catalog.books)
             {
-                return Some(book);
+                return Some(index);
             }
         }
 
         for what in &self.catch_all {
-            if let Some(book) = what.pick(books) {
-                return Some(book);
+            if let Some(index) = what.pick(&catalog.books) {
+                return Some(index);
             }
         }
 
@@ -458,16 +495,34 @@ fn main() -> Result<()> {
     let mut by_number = BTreeMap::<_, Vec<_>>::new();
     let mut names = BTreeSet::new();
 
-    for book in books_by_path.values() {
-        for &n in book.numbers.iter() {
+    for (_, book) in books_by_path.iter() {
+        names.insert(book.name);
+
+        for n in book.numbers.iter() {
             by_number.entry(n).or_default().push(book);
         }
-
-        names.insert(book.name);
     }
 
     for value in by_number.values_mut() {
         value.sort_by_key(|book| (book.name, book.dir));
+    }
+
+    if !opts.include.is_empty() {
+        by_number.retain(|&&number, _| {
+            opts.include
+                .iter()
+                .any(|predicate| predicate.matches(number))
+        });
+    }
+
+    let mut state = State::default();
+
+    for (&number, books) in by_number {
+        if books.len() == 1 {
+            state.picked.insert(state.catalogs.len(), 0);
+        }
+
+        state.catalogs.push(Catalog { number, books });
     }
 
     let name = 'name: {
@@ -496,24 +551,16 @@ fn main() -> Result<()> {
         bail!("Aborting due to previous issues.");
     };
 
-    let mut picked = BTreeMap::new();
     let mut errors = 0;
     let mut pick_state = None::<interactive::Pick>;
 
     'outer: loop {
-        let Some((number, books)) = by_number.first_key_value() else {
-            break 'outer;
+        let Some((index, catalog)) = state.next_unpicked() else {
+            break;
         };
 
-        let number = *number;
-
-        if !opts.include.is_empty() && !opts.include.iter().any(|to| to.matches(number)) {
-            by_number.remove(&number);
-            continue;
-        }
-
         let book = 'book: {
-            if let Some(book) = picker.pick(number, &books) {
+            if let Some(book) = picker.pick(catalog) {
                 break 'book book;
             }
 
@@ -525,9 +572,10 @@ fn main() -> Result<()> {
                 writeln!(
                     o,
                     "{number:03}: more than one match, use something like `-p {number}=0` to pick one:",
+                    number = catalog.number,
                 )?;
 
-                for (index, book) in books.iter().enumerate() {
+                for (index, book) in catalog.books.iter().enumerate() {
                     writeln!(
                         o,
                         "  {index}: {} ({} pages, {} bytes)",
@@ -548,43 +596,44 @@ fn main() -> Result<()> {
                 continue 'outer;
             }
 
-            let title = format!("Book #{number} has more than one match, please pick one:");
-            let state = pick_state.get_or_insert_default();
+            let title = format!(
+                "Pick book #{number}/{total}:",
+                number = catalog.number,
+                total = state.catalogs.len(),
+            );
+            let pick_state = pick_state.get_or_insert_default();
 
-            loop {
-                let index = match state.pick(&title, &books, &picked)? {
-                    Outcome::Picked(index) => index,
-                    Outcome::Unpicked(unpicked) => {
-                        let Some((number, (_, books))) = picked.remove_entry(&unpicked) else {
-                            continue;
-                        };
-
-                        by_number.insert(number, books);
-                        continue 'outer;
+            match pick_state.pick(&title, &catalog.books, &state)? {
+                Action::Picked(index) => index,
+                Action::Unpick(n) => {
+                    if let Some(key) = state.picked.keys().nth(n).copied() {
+                        state.picked.remove(&key);
                     }
-                    Outcome::Quit => {
-                        return Err(anyhow!("Aborting due to user cancellation."));
-                    }
-                };
 
-                if let Some(book) = books.get(index).copied() {
-                    break book;
+                    continue 'outer;
+                }
+                Action::Quit => {
+                    return Err(anyhow!("Aborting due to user cancellation."));
                 }
             }
         };
 
-        let Some(books) = by_number.remove(&number) else {
-            continue;
-        };
-
-        picked.insert(number, (book, books));
+        state.picked.insert(index, book);
     }
 
     ensure!(errors == 0, "Aborting due to {errors} previous issues.");
 
-    for (number, (book, _)) in picked {
+    for (c, n) in state.picked {
+        let Some((catalog, book)) = state
+            .catalogs
+            .get(c)
+            .and_then(|c| Some((c, c.books.get(n)?)))
+        else {
+            continue;
+        };
+
         let mut target = opts.out.clone();
-        target.push(format!("{name}{number:03}"));
+        target.push(format!("{name}{c:03}"));
         target.add_extension("cbz");
 
         let color = if opts.dry_run { &warn } else { &ok };
@@ -592,10 +641,10 @@ fn main() -> Result<()> {
         write!(o, "[from]")?;
         o.reset()?;
 
-        writeln!(o, " {number:03}: {}", book.dir.display())?;
+        writeln!(o, " {c:03}: {}", book.dir.display())?;
 
-        let comic_info = config_info(&opts, &name, number, book.pages.len())
-            .context("ComicInfo.xml generation")?;
+        let comic_info =
+            config_info(&opts, &name, catalog, book).context("ComicInfo.xml generation")?;
 
         if opts.verbose {
             o.set_color(&ok)?;
@@ -682,7 +731,12 @@ fn numbers(mut input: &str) -> impl Iterator<Item = u32> {
 }
 
 /// Generates ComicInfo.xml content if any metadata options are provided.
-fn config_info(opts: &Opts, name: &str, number: u32, page_count: usize) -> Result<String> {
+fn config_info(
+    opts: &Opts,
+    name: &str,
+    catalog: &Catalog<'_, '_>,
+    book: &Book<'_>,
+) -> Result<String> {
     let mut o = String::new();
 
     writeln!(o, "<?xml version=\"1.0\" encoding=\"utf-8\"?>")?;
@@ -694,14 +748,13 @@ fn config_info(opts: &Opts, name: &str, number: u32, page_count: usize) -> Resul
     writeln!(
         o,
         "  <Title>{}</Title>",
-        xml_escape(&format!("{name}{number}"))
+        xml_escape(&format!("{name}{}", catalog.number))
     )?;
 
     let series = opts.series.as_deref().unwrap_or(name);
     writeln!(o, "  <Series>{}</Series>", xml_escape(series))?;
-
-    writeln!(o, "  <Number>{number}</Number>")?;
-    writeln!(o, "  <PageCount>{page_count}</PageCount>")?;
+    writeln!(o, "  <Number>{}</Number>", catalog.number)?;
+    writeln!(o, "  <PageCount>{}</PageCount>", book.pages.len())?;
 
     if let Some(author) = &opts.author {
         writeln!(o, "  <Writer>{}</Writer>", xml_escape(author))?;
