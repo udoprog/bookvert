@@ -22,8 +22,6 @@ use termcolor::{ColorSpec, WriteColor};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-use crate::interactive::Action;
-
 mod interactive;
 
 struct Catalog<'book, 'a> {
@@ -33,6 +31,7 @@ struct Catalog<'book, 'a> {
 
 #[derive(Default)]
 struct State<'book, 'a> {
+    name: Option<String>,
     catalogs: Vec<Catalog<'book, 'a>>,
     picked: BTreeMap<usize, usize>,
 }
@@ -525,9 +524,11 @@ fn main() -> Result<()> {
         state.catalogs.push(Catalog { number, books });
     }
 
-    let name = 'name: {
+    // Automatically determine name to use.
+    'name: {
         if let Some(name) = &opts.name {
-            break 'name name.clone();
+            state.name = Some(name.clone());
+            break 'name;
         }
 
         let mut it = names.iter();
@@ -535,93 +536,76 @@ fn main() -> Result<()> {
         if let Some(first) = it.next()
             && it.next().is_none()
         {
-            break 'name first.to_string();
+            state.name = Some(first.to_string());
+            break 'name;
         }
-
-        o.set_color(&error)?;
-        write!(o, "[error] ")?;
-        o.reset()?;
-
-        writeln!(o, "Use `--name <name>` to set one name of the series:")?;
-
-        for name in &names {
-            writeln!(o, "  {}", escape(name))?;
-        }
-
-        bail!("Aborting due to previous issues.");
-    };
-
-    let mut errors = 0;
-    let mut pick_state = None::<interactive::Pick>;
-
-    'outer: loop {
-        let Some((index, catalog)) = state.next_unpicked() else {
-            break;
-        };
-
-        let book = 'book: {
-            if let Some(book) = picker.pick(catalog) {
-                break 'book book;
-            }
-
-            if opts.noninteractive {
-                o.set_color(&error)?;
-                write!(o, "[error] ")?;
-                o.reset()?;
-
-                writeln!(
-                    o,
-                    "{number:03}: more than one match, use something like `-p {number}=0` to pick one:",
-                    number = catalog.number,
-                )?;
-
-                for (index, book) in catalog.books.iter().enumerate() {
-                    writeln!(
-                        o,
-                        "  {index}: {} ({} pages, {} bytes)",
-                        escape(book.name),
-                        book.pages.len(),
-                        book.bytes(),
-                    )?;
-
-                    if opts.verbose {
-                        o.set_color(&warn)?;
-                        write!(o, "    [source]")?;
-                        o.reset()?;
-                        writeln!(o, " {}", book.dir.display())?;
-                    }
-                }
-
-                errors += 1;
-                continue 'outer;
-            }
-
-            let title = format!(
-                "Pick book #{number}/{total}:",
-                number = catalog.number,
-                total = state.catalogs.len(),
-            );
-            let pick_state = pick_state.get_or_insert_default();
-
-            match pick_state.pick(&title, &catalog.books, &state)? {
-                Action::Picked(index) => index,
-                Action::Unpick(n) => {
-                    if let Some(key) = state.picked.keys().nth(n).copied() {
-                        state.picked.remove(&key);
-                    }
-
-                    continue 'outer;
-                }
-                Action::Quit => {
-                    return Err(anyhow!("Aborting due to user cancellation."));
-                }
-            }
-        };
-
-        state.picked.insert(index, book);
     }
 
-    ensure!(errors == 0, "Aborting due to {errors} previous issues.");
+    // Automatically seed picks based on options.
+    for (index, catalog) in state.catalogs.iter().enumerate() {
+        if state.picked.contains_key(&index) {
+            continue;
+        }
+
+        if let Some(book) = picker.pick(catalog) {
+            state.picked.insert(index, book);
+        }
+    }
+
+    if opts.noninteractive {
+        if state.name.is_none() {
+            o.set_color(&error)?;
+            write!(o, "[error] ")?;
+            o.reset()?;
+
+            writeln!(o, "Use `--name <name>` to set one name of the series:")?;
+
+            for name in &names {
+                writeln!(o, "  {}", escape(name))?;
+            }
+        }
+
+        for (index, catalog) in state.catalogs.iter().enumerate() {
+            if state.picked.contains_key(&index) {
+                continue;
+            }
+
+            o.set_color(&error)?;
+            write!(o, "[error] ")?;
+            o.reset()?;
+
+            writeln!(
+                o,
+                "{number:03}: more than one match, use something like `-p {number}=0` to pick one:",
+                number = catalog.number,
+            )?;
+
+            for (idx, book) in catalog.books.iter().enumerate() {
+                writeln!(
+                    o,
+                    "  {idx}: {} ({} pages, {} bytes)",
+                    escape(book.name),
+                    book.pages.len(),
+                    book.bytes(),
+                )?;
+
+                if opts.verbose {
+                    o.set_color(&warn)?;
+                    write!(o, "    [source]")?;
+                    o.reset()?;
+                    writeln!(o, " {}", book.dir.display())?;
+                }
+            }
+        }
+    } else {
+        let mut app = interactive::App::default();
+
+        if !app.run(&mut state)? {
+            return Err(anyhow!("Aborting due to user cancellation."));
+        }
+    }
+
+    let name = state.name.context("No name specified for catalog")?;
 
     for (c, n) in state.picked {
         let Some((catalog, book)) = state
