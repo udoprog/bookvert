@@ -22,6 +22,10 @@ use termcolor::{ColorSpec, WriteColor};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use crate::interactive::Outcome;
+
+mod interactive;
+
 /// Helper tool to batch convert files into a .cbr
 #[derive(Parser)]
 #[command(about, version, max_term_width = 80)]
@@ -50,6 +54,9 @@ struct Opts {
     /// Overwrite existing files.
     #[arg(long, short = 'f')]
     force: bool,
+    /// Non-interactive mode: errors out if a choice is required.
+    #[arg(long, short = 'n')]
+    noninteractive: bool,
     /// Verbose output.
     #[arg(long, short = 'v')]
     verbose: bool,
@@ -489,53 +496,93 @@ fn main() -> Result<()> {
         bail!("Aborting due to previous issues.");
     };
 
-    let mut picked = Vec::new();
+    let mut picked = BTreeMap::new();
     let mut errors = 0;
+    let mut pick_state = None::<interactive::Pick>;
 
-    for (number, books) in &by_number {
+    'outer: loop {
+        let Some((number, books)) = by_number.first_key_value() else {
+            break 'outer;
+        };
+
         let number = *number;
 
         if !opts.include.is_empty() && !opts.include.iter().any(|to| to.matches(number)) {
+            by_number.remove(&number);
             continue;
         }
 
-        let Some(book) = picker.pick(number, books) else {
-            o.set_color(&error)?;
-            write!(o, "[error] ")?;
-            o.reset()?;
-
-            writeln!(
-                o,
-                "{number:03}: more than one match, use something like `-p {number}=0` to pick one:",
-            )?;
-
-            for (index, book) in books.iter().enumerate() {
-                writeln!(
-                    o,
-                    "  {index}: {} ({} pages, {} bytes)",
-                    escape(book.name),
-                    book.pages.len(),
-                    book.bytes(),
-                )?;
-
-                if opts.verbose {
-                    o.set_color(&warn)?;
-                    write!(o, "    [source]")?;
-                    o.reset()?;
-                    writeln!(o, " {}", book.dir.display())?;
-                }
+        let book = 'book: {
+            if let Some(book) = picker.pick(number, &books) {
+                break 'book book;
             }
 
-            errors += 1;
+            if opts.noninteractive {
+                o.set_color(&error)?;
+                write!(o, "[error] ")?;
+                o.reset()?;
+
+                writeln!(
+                    o,
+                    "{number:03}: more than one match, use something like `-p {number}=0` to pick one:",
+                )?;
+
+                for (index, book) in books.iter().enumerate() {
+                    writeln!(
+                        o,
+                        "  {index}: {} ({} pages, {} bytes)",
+                        escape(book.name),
+                        book.pages.len(),
+                        book.bytes(),
+                    )?;
+
+                    if opts.verbose {
+                        o.set_color(&warn)?;
+                        write!(o, "    [source]")?;
+                        o.reset()?;
+                        writeln!(o, " {}", book.dir.display())?;
+                    }
+                }
+
+                errors += 1;
+                continue 'outer;
+            }
+
+            let title = format!("Book #{number} has more than one match, please pick one:");
+            let state = pick_state.get_or_insert_default();
+
+            loop {
+                let index = match state.pick(&title, &books, &picked)? {
+                    Outcome::Picked(index) => index,
+                    Outcome::Unpicked(unpicked) => {
+                        let Some((number, (_, books))) = picked.remove_entry(&unpicked) else {
+                            continue;
+                        };
+
+                        by_number.insert(number, books);
+                        continue 'outer;
+                    }
+                    Outcome::Quit => {
+                        return Err(anyhow!("Aborting due to user cancellation."));
+                    }
+                };
+
+                if let Some(book) = books.get(index).copied() {
+                    break book;
+                }
+            }
+        };
+
+        let Some(books) = by_number.remove(&number) else {
             continue;
         };
 
-        picked.push((number, book));
+        picked.insert(number, (book, books));
     }
 
-    ensure!(errors == 0, "Aborting due to previous issues.");
+    ensure!(errors == 0, "Aborting due to {errors} previous issues.");
 
-    for (number, book) in picked {
+    for (number, (book, _)) in picked {
         let mut target = opts.out.clone();
         target.push(format!("{name}{number:03}"));
         target.add_extension("cbz");

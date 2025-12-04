@@ -8,6 +8,7 @@ anyhow = "1.0.100"
 clap = { version = "4.5.53", features = ["derive", "unicode", "wrap_help"] }
 ignore = "0.4.25"
 language-tags = "0.3.2"
+ratatui = { version = "0.29.0", default-features = false, features = ["crossterm"] }
 regex = "1.12.2"
 termcolor = "1.4.1"
 zip = "6.0.0"
