@@ -6,8 +6,12 @@ use std::rc::Rc;
 /// The state of a bookvert session.
 #[derive(Default)]
 pub struct State {
+    /// The name of the series.
     pub name: Option<String>,
+    /// The filesystem detected name of the series. These can be used to support
+    /// an interactive session where you can for example pick names from a list.
     pub names: BTreeSet<String>,
+    /// The detected catalogs in the session.
     pub catalogs: Vec<Catalog>,
 }
 
@@ -37,16 +41,25 @@ impl Catalog {
     }
 }
 
+/// Data about a page.
 pub struct Page {
+    /// The filesystem name of the page.
     pub path: PathBuf,
+    /// The name of the page.
     pub name: String,
+    /// The filesystem metadata of the page.
     pub metadata: Metadata,
 }
 
+/// Data about a book.
 pub struct Book {
+    /// The directory where the book is located.
     pub dir: PathBuf,
+    /// The name of the book.
     pub name: String,
+    /// The pages in the book.
     pub pages: Vec<Page>,
+    /// The series numbers associated with the book.
     pub numbers: BTreeSet<u32>,
 }
 

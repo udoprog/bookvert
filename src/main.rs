@@ -436,7 +436,7 @@ fn main() -> Result<()> {
         });
 
         book.pages.push(Page {
-            path: from.clone(),
+            path: from.to_owned(),
             name: format!("p{:03}.{ext}", book.pages.len()),
             metadata: fs::metadata(from)
                 .with_context(|| anyhow!("{}: Failed to get metadata", from.display()))?,
