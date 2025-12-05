@@ -27,6 +27,7 @@ use crate::state::{Book, Catalog, Page, State};
 
 mod interactive;
 mod state;
+mod styles;
 
 /// Helper tool to batch convert files into a .cbr
 #[derive(Parser)]

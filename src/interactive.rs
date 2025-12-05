@@ -1,10 +1,9 @@
-use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -13,140 +12,7 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::State;
-
-/// Centralized styling configuration for the TUI.
-struct Styles {
-    selected_marker: &'static str,
-    done_marker: &'static str,
-    empty_marker: &'static str,
-    editing_marker: &'static str,
-    color_done: Color,
-    color_normal: Color,
-    color_not_done: Color,
-    color_dim: Color,
-    color_header: Color,
-    color_editing: Color,
-    color_warning: Color,
-}
-
-impl Styles {
-    fn marker(&self, selected: bool, done: bool) -> &'static str {
-        if selected {
-            self.selected_marker
-        } else if done {
-            self.done_marker
-        } else {
-            self.empty_marker
-        }
-    }
-
-    fn item_style(&self, selected: bool, done: bool) -> Style {
-        let mut s = Style::default();
-
-        if done {
-            s = s.fg(self.color_done);
-        } else {
-            s = s.fg(self.color_not_done);
-        };
-
-        if selected {
-            s = s.add_modifier(Modifier::BOLD);
-        }
-
-        s
-    }
-
-    fn normal_item_style(&self, selected: bool, done: bool) -> Style {
-        let mut s = Style::default();
-
-        if done {
-            s = s.fg(self.color_done);
-        } else {
-            s = s.fg(self.color_normal);
-        };
-
-        if selected {
-            s = s.add_modifier(Modifier::BOLD);
-        }
-
-        s
-    }
-
-    fn header_style(&self) -> Style {
-        Style::default().fg(self.color_header).bold()
-    }
-
-    fn header_hint_style(&self) -> Style {
-        Style::default().fg(self.color_header)
-    }
-
-    fn dim_style(&self) -> Style {
-        Style::default().fg(self.color_dim)
-    }
-
-    fn warning_style(&self) -> Style {
-        Style::default().fg(self.color_warning).bold()
-    }
-
-    fn warning_text_style(&self) -> Style {
-        Style::default().fg(self.color_warning)
-    }
-
-    fn button_style(&self, selected: bool, positive: bool) -> Style {
-        let mut s = Style::default();
-
-        if positive {
-            s = s.fg(self.color_done);
-        } else {
-            s = s.fg(self.color_not_done);
-        }
-
-        if selected {
-            s = s.add_modifier(Modifier::BOLD);
-        }
-
-        s
-    }
-
-    fn input_style(&self, selected: bool, editing: bool) -> Style {
-        let mut s = Style::default();
-
-        if editing {
-            s = s.fg(self.color_editing).add_modifier(Modifier::BOLD);
-        } else if selected {
-            s = s.fg(self.color_normal).add_modifier(Modifier::BOLD);
-        } else {
-            s = s.fg(self.color_normal);
-        }
-
-        s
-    }
-
-    fn input_marker(&self, selected: bool, editing: bool) -> &'static str {
-        if editing {
-            self.editing_marker
-        } else if selected {
-            self.selected_marker
-        } else {
-            self.empty_marker
-        }
-    }
-}
-
-/// Global styles instance.
-const STYLES: Styles = Styles {
-    selected_marker: "*",
-    done_marker: "✓",
-    empty_marker: " ",
-    editing_marker: ">",
-    color_done: Color::Green,
-    color_normal: Color::Reset,
-    color_not_done: Color::Red,
-    color_dim: Color::DarkGray,
-    color_header: Color::Cyan,
-    color_editing: Color::Cyan,
-    color_warning: Color::Yellow,
-};
+use crate::styles::STYLES;
 
 enum ViewEvent {
     PushView(View),
@@ -349,7 +215,6 @@ struct BooksView {
     category: usize,
     index: usize,
     list_state: ListState,
-    expanded: HashSet<usize>,
 }
 
 impl BooksView {
@@ -358,7 +223,6 @@ impl BooksView {
             category,
             index,
             list_state: ListState::default(),
-            expanded: HashSet::new(),
         }
     }
 
@@ -379,22 +243,6 @@ impl BooksView {
             }
             Left | Char('h') | Esc | Char('q') => {
                 return ViewEvent::PopView;
-            }
-            Char('I') => {
-                if let Some(catalog) = state.catalogs.get(self.category) {
-                    if self.expanded.len() == catalog.books.len() {
-                        self.expanded.clear();
-                    } else {
-                        self.expanded.extend(0..catalog.books.len());
-                    }
-                }
-            }
-            Char('i' | ' ') => {
-                if self.expanded.contains(&self.index) {
-                    self.expanded.remove(&self.index);
-                } else {
-                    self.expanded.insert(self.index);
-                }
             }
             Enter | Char('o') => {
                 if let Some(c) = state.catalogs.get_mut(self.category) {
@@ -428,28 +276,27 @@ impl BooksView {
             let marker = STYLES.marker(is_selected, is_picked);
             let style = STYLES.normal_item_style(is_selected, is_picked);
 
-            let line = Line::from(vec![
-                Span::styled(format!("{marker} "), style),
-                Span::styled(
-                    format!(
-                        "{} ({} pages, {} bytes)",
-                        book.name,
-                        book.pages.len(),
-                        book.bytes(),
-                    ),
-                    style,
-                ),
-            ]);
+            let dir = book.dir.parent().unwrap_or(Path::new("."));
 
-            items.push(ListItem::new(line));
+            items.push(ListItem::new(Span::styled(
+                format!("{marker} {}", book.name),
+                style,
+            )));
 
-            if self.expanded.contains(&i) {
-                let path_line = Line::from(Span::styled(
-                    format!("    {}", book.dir.display()),
-                    STYLES.dim_style(),
-                ));
-                items.push(ListItem::new(path_line));
-            }
+            items.push(ListItem::new(Span::styled(
+                format!("    pages: {}", book.pages.len()),
+                STYLES.dim_style(),
+            )));
+
+            items.push(ListItem::new(Span::styled(
+                format!("    bytes: {}", book.bytes()),
+                STYLES.dim_style(),
+            )));
+
+            items.push(ListItem::new(Span::styled(
+                format!("    from {}", dir.display()),
+                STYLES.dim_style(),
+            )));
         }
 
         self.list_state.select(selected);
@@ -699,7 +546,7 @@ impl ConfirmView {
             STYLES.warning_text_style(),
         )]);
 
-        let prompt = Line::from(vec![Span::styled("Continue anyway? ", Style::default())]);
+        let prompt = Line::from("Continue anyway? ");
 
         let no_style = STYLES.button_style(!self.selected, false);
         let yes_style = STYLES.button_style(self.selected, true);
