@@ -71,7 +71,7 @@
 //! - `-p 3=1` picks the second match for book number 3.
 //! - `-p 1..=5=most-pages` picks the match with the most pages for books 1
 //!   through 5.
-//! - `-p fix' will match *any* book that contains the string `fix`.
+//! - `-p fix` will match *any* book that contains the string `fix`.
 //!
 //! [examples]: https://github.com/udoprog/bookvert/tree/main/examples
 
