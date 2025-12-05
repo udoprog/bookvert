@@ -11,7 +11,7 @@ use ratatui::widgets::{
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use crate::State;
+use crate::state::State;
 use crate::styles::STYLES;
 
 enum ViewEvent {
@@ -146,7 +146,7 @@ impl CatalogsView {
 
             let picked_info = if let Some(picked) = catalog.picked {
                 if let Some(book) = catalog.books.get(picked) {
-                    format!("{}", book.name)
+                    book.name.clone()
                 } else {
                     String::new()
                 }
@@ -578,13 +578,15 @@ enum View {
     Confirm(ConfirmView),
 }
 
+/// The interactive application of bookvert.
 #[derive(Default)]
-pub(crate) struct App {
+pub struct App {
     views: Vec<View>,
 }
 
 impl App {
-    pub(crate) fn run(&mut self, state: &mut State) -> Result<bool> {
+    /// Run the interactive application.
+    pub fn run(&mut self, state: &mut State) -> Result<bool> {
         self.views.clear();
         self.views.push(View::Catalogs(CatalogsView::default()));
 

@@ -3,12 +3,12 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-/// Calculated application state.
+/// The state of a bookvert session.
 #[derive(Default)]
-pub(crate) struct State {
-    pub(crate) name: Option<String>,
-    pub(crate) names: BTreeSet<String>,
-    pub(crate) catalogs: Vec<Catalog>,
+pub struct State {
+    pub name: Option<String>,
+    pub names: BTreeSet<String>,
+    pub catalogs: Vec<Catalog>,
 }
 
 impl State {
@@ -20,46 +20,46 @@ impl State {
 }
 
 /// The state for a single catalog.
-pub(crate) struct Catalog {
+pub struct Catalog {
     /// The catalog number.
-    pub(crate) number: u32,
+    pub number: u32,
     /// The books in the catalog.
-    pub(crate) books: Vec<Rc<Book>>,
+    pub books: Vec<Rc<Book>>,
     /// The picked book.
-    pub(crate) picked: Option<usize>,
+    pub picked: Option<usize>,
 }
 
 impl Catalog {
     /// Returns the selected book, if any.
     #[inline]
-    pub(crate) fn selected(&self) -> Option<&Book> {
+    pub fn selected(&self) -> Option<&Book> {
         Some(self.books.get(self.picked?)?.as_ref())
     }
 }
 
-pub(crate) struct Page {
-    pub(crate) path: PathBuf,
-    pub(crate) name: String,
-    pub(crate) metadata: Metadata,
+pub struct Page {
+    pub path: PathBuf,
+    pub name: String,
+    pub metadata: Metadata,
 }
 
-pub(crate) struct Book {
-    pub(crate) dir: PathBuf,
-    pub(crate) name: String,
-    pub(crate) pages: Vec<Page>,
-    pub(crate) numbers: BTreeSet<u32>,
+pub struct Book {
+    pub dir: PathBuf,
+    pub name: String,
+    pub pages: Vec<Page>,
+    pub numbers: BTreeSet<u32>,
 }
 
 impl Book {
     /// Returns a key for sorting books by name and directory.
     #[inline]
-    pub(crate) fn key(&self) -> (&str, &Path) {
+    pub fn key(&self) -> (&str, &Path) {
         (&self.name, &self.dir)
     }
 
     /// Returns the total size of all pages in bytes.
     #[inline]
-    pub(crate) fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> u64 {
         self.pages.iter().map(|page| page.metadata.len()).sum()
     }
 }

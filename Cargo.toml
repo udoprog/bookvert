@@ -1,15 +1,15 @@
 [package]
 name = "bookvert"
-version = "0.0.1"
+version = "0.0.2"
 authors = ["John-John Tedro <udoprog@tedro.se>"]
 edition = "2024"
-description = "Comic Book Converter by John-John Tedro"
+description = "Conveniently convert a batch of directories into a book formats like .cbz"
 documentation = "https://docs.rs/bookvert"
 readme = "README.md"
 homepage = "https://github.com/udoprog/bookvert"
 repository = "https://github.com/udoprog/bookvert"
-license = "MIT/Apache-2.0"
-keywords = ["cli", "tui", "comic", "cbz"]
+license = "MIT OR Apache-2.0"
+keywords = ["cbz", "cli", "comic", "tui"]
 categories = ["command-line-utilities"]
 
 [dependencies]
