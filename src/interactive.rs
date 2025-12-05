@@ -185,29 +185,39 @@ impl CatalogsView {
             }
             Right | Enter | Char('l' | 'o' | ' ') => {
                 if self.index == 0 {
-                    if !state.picked.is_empty() {
-                        if state.picked.len() < state.catalogs.len() {
+                    let n = state.picked();
+
+                    if n > 0 {
+                        if n < state.catalogs.len() {
                             return ViewEvent::PushView(View::Confirm(ConfirmView::default()));
                         }
+
                         return ViewEvent::Finish;
                     }
                 } else if self.index == 1 {
                     return ViewEvent::PushView(View::Name(NameView::new(state.name.as_deref())));
                 } else {
                     let category = self.index.saturating_sub(2);
-                    let index = state.picked.get(&category).copied().unwrap_or(0);
+                    let index = state
+                        .catalogs
+                        .get(category)
+                        .and_then(|c| c.picked)
+                        .unwrap_or(0);
                     return ViewEvent::PushView(View::Books(BooksView::new(category, index)));
                 }
             }
             Esc | Char('q') => {
                 return ViewEvent::PopView;
             }
-            Char('x') if !state.picked.is_empty() => {
+            Char('x') => {
                 return ViewEvent::Finish;
             }
             Backspace | Char('c') if self.index >= 2 => {
                 let category = self.index.saturating_sub(2);
-                state.picked.remove(&category);
+
+                if let Some(c) = state.catalogs.get_mut(category) {
+                    c.picked = None;
+                }
             }
             _ => {}
         }
@@ -215,12 +225,12 @@ impl CatalogsView {
         ViewEvent::None
     }
 
-    fn draw(&mut self, state: &State<'_, '_>, frame: &mut Frame) {
+    fn draw(&mut self, state: &State, frame: &mut Frame) {
         let mut selected = None;
 
         let sub_header = {
             let is_selected = self.index == 0;
-            let picked_count = state.picked.len();
+            let picked_count = state.picked();
             let total_count = state.catalogs.len();
             let all_picked = picked_count == total_count;
 
@@ -258,7 +268,7 @@ impl CatalogsView {
 
         for (i, catalog) in state.catalogs.iter().enumerate() {
             let is_selected = i.saturating_add(2) == self.index;
-            let is_picked = state.picked.contains_key(&i);
+            let is_picked = catalog.picked.is_some();
 
             if is_selected {
                 selected = Some(items.len());
@@ -267,7 +277,7 @@ impl CatalogsView {
             let marker = STYLES.marker(is_selected, is_picked);
             let style = STYLES.item_style(is_selected, is_picked);
 
-            let picked_info = if let Some(&book_idx) = state.picked.get(&i) {
+            let picked_info = if let Some(book_idx) = catalog.picked {
                 if let Some(book) = catalog.books.get(book_idx) {
                     format!(" {}", book.name)
                 } else {
@@ -387,7 +397,10 @@ impl BooksView {
                 }
             }
             Enter | Char('o') => {
-                state.picked.insert(self.category, self.index);
+                if let Some(c) = state.catalogs.get_mut(self.category) {
+                    c.picked = Some(self.index);
+                }
+
                 return ViewEvent::PopAndSelectNext;
             }
             _ => {}
@@ -396,18 +409,17 @@ impl BooksView {
         ViewEvent::None
     }
 
-    fn draw(&mut self, state: &State<'_, '_>, frame: &mut Frame) {
+    fn draw(&mut self, state: &State, frame: &mut Frame) {
         let Some(catalog) = state.catalogs.get(self.category) else {
             return;
         };
 
         let mut items = Vec::new();
         let mut selected = None;
-        let current_pick = state.picked.get(&self.category).copied();
 
         for (i, book) in catalog.books.iter().enumerate() {
             let is_selected = i == self.index;
-            let is_picked = current_pick == Some(i);
+            let is_picked = catalog.picked == Some(i);
 
             if is_selected {
                 selected = Some(items.len());
@@ -532,8 +544,8 @@ impl NameView {
                     } else {
                         self.editing = true;
                     }
-                } else if let Some(&name) = state.names.get(self.index.saturating_sub(1)) {
-                    state.name = Some(name.to_string());
+                } else if let Some(name) = state.names.iter().nth(self.index.saturating_sub(1)) {
+                    state.name = Some(name.clone());
                     return ViewEvent::PopView;
                 }
             }
@@ -546,7 +558,7 @@ impl NameView {
         ViewEvent::None
     }
 
-    fn draw(&mut self, state: &State<'_, '_>, frame: &mut Frame) {
+    fn draw(&mut self, state: &State, frame: &mut Frame) {
         let editing = self.editing && self.index == 0;
 
         let header = Line::from(vec![
@@ -582,7 +594,7 @@ impl NameView {
 
         for (i, name) in state.names.iter().enumerate() {
             let is_selected = i.saturating_add(1) == self.index;
-            let is_current = state.name.as_deref() == Some(*name);
+            let is_current = state.name.as_deref() == Some(name.as_str());
 
             if is_selected {
                 selected = Some(items.len());
@@ -666,8 +678,8 @@ impl ConfirmView {
         ViewEvent::None
     }
 
-    fn draw(&mut self, state: &State<'_, '_>, frame: &mut Frame) {
-        let picked_count = state.picked.len();
+    fn draw(&mut self, state: &State, frame: &mut Frame) {
+        let picked_count = state.picked();
         let total_count = state.catalogs.len();
         let missing = total_count.saturating_sub(picked_count);
 
@@ -718,7 +730,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn run(&mut self, state: &mut State<'_, '_>) -> Result<bool> {
+    pub(crate) fn run(&mut self, state: &mut State) -> Result<bool> {
         self.views.clear();
         self.views.push(View::Catalogs(CatalogsView::default()));
 
@@ -763,8 +775,7 @@ impl App {
                 ViewEvent::PopAndSelectNext => {
                     self.views.pop();
                     if let Some(View::Catalogs(v)) = self.views.last_mut()
-                        && let Some(next) =
-                            (0..state.catalogs.len()).find(|i| !state.picked.contains_key(i))
+                        && let Some(next) = state.catalogs.iter().position(|c| c.picked.is_none())
                     {
                         v.index = next.saturating_add(2);
                     }

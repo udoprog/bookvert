@@ -9,9 +9,10 @@ use core::str::FromStr;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, Metadata};
+use std::fs;
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -22,20 +23,10 @@ use termcolor::{ColorSpec, StandardStream, WriteColor};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use crate::state::{Book, Catalog, Page, State};
+
 mod interactive;
-
-struct Catalog<'book, 'a> {
-    number: u32,
-    books: Vec<&'book Book<'a>>,
-}
-
-#[derive(Default)]
-struct State<'book, 'a> {
-    name: Option<String>,
-    names: Vec<&'a str>,
-    catalogs: Vec<Catalog<'book, 'a>>,
-    picked: BTreeMap<usize, usize>,
-}
+mod state;
 
 /// Helper tool to batch convert files into a .cbr
 #[derive(Parser)]
@@ -140,27 +131,6 @@ impl fmt::Display for Manga {
     }
 }
 
-struct Page {
-    path: PathBuf,
-    name: String,
-    metadata: Metadata,
-}
-
-struct Book<'a> {
-    dir: &'a Path,
-    name: &'a str,
-    pages: Vec<Page>,
-    numbers: BTreeSet<u32>,
-}
-
-impl Book<'_> {
-    /// Returns the total size of all pages in bytes.
-    #[inline]
-    fn bytes(&self) -> u64 {
-        self.pages.iter().map(|page| page.metadata.len()).sum()
-    }
-}
-
 enum To {
     First,
     Last,
@@ -173,7 +143,7 @@ enum To {
 
 impl To {
     /// Picks a book from the list according to the strategy.
-    fn pick(&self, books: &[&Book<'_>]) -> Option<usize> {
+    fn pick(&self, books: &[Rc<Book>]) -> Option<usize> {
         match *self {
             To::First if !books.is_empty() => Some(0),
             To::Last => books.len().checked_sub(1),
@@ -196,7 +166,7 @@ impl To {
             To::Regex(ref re) => books
                 .iter()
                 .enumerate()
-                .find(|(_, book)| re.is_match(book.name))
+                .find(|(_, book)| re.is_match(&book.name))
                 .map(|(i, _)| i),
             _ => None,
         }
@@ -346,7 +316,7 @@ impl Picker {
     }
 
     /// Returns the index of the book to pick, or None if no predicate matched.
-    fn pick(&self, catalog: &Catalog<'_, '_>) -> Option<usize> {
+    fn pick(&self, catalog: &Catalog) -> Option<usize> {
         for m in &self.matches {
             if m.from.matches(catalog.number)
                 && let Some(index) = m.to.pick(&catalog.books)
@@ -398,7 +368,6 @@ fn main() -> Result<()> {
     let opts = Opts::try_parse()?;
 
     let mut skip = Vec::<Regex>::new();
-
     let mut picker = Picker::default();
 
     for pat in &opts.pick {
@@ -446,7 +415,13 @@ fn main() -> Result<()> {
 
     files.sort();
 
-    let mut books_by_path = BTreeMap::<&Path, Book<'_>>::new();
+    let o = StandardStream::stdout(termcolor::ColorChoice::Auto);
+    let mut o = o.lock();
+
+    let mut books_by_path = BTreeMap::<&Path, _>::new();
+    let mut by_number = BTreeMap::<_, Vec<_>>::new();
+    let mut names = BTreeSet::new();
+    let mut state = State::default();
 
     for (from, ext) in &files {
         let Some(dir) = from.parent() else {
@@ -457,9 +432,13 @@ fn main() -> Result<()> {
             continue;
         };
 
+        if skip.iter().any(|re| re.is_match(name)) {
+            continue;
+        }
+
         let book = books_by_path.entry(dir).or_insert_with(|| Book {
-            dir,
-            name,
+            dir: dir.to_path_buf(),
+            name: name.to_string(),
             pages: Vec::new(),
             numbers: numbers(name).collect(),
         });
@@ -472,50 +451,45 @@ fn main() -> Result<()> {
         });
     }
 
-    if !skip.is_empty() {
-        books_by_path.retain(|_, book| !skip.iter().any(|re| re.is_match(book.name)));
-    }
+    for (_, book) in books_by_path {
+        let book = Rc::new(book);
 
-    let o = StandardStream::stdout(termcolor::ColorChoice::Auto);
-    let mut o = o.lock();
+        names.insert(book.name.clone());
 
-    let mut by_number = BTreeMap::<_, Vec<_>>::new();
-    let mut names = BTreeSet::new();
-
-    for (_, book) in books_by_path.iter() {
-        names.insert(book.name);
-
-        for n in book.numbers.iter() {
-            by_number.entry(n).or_default().push(book);
+        for &n in &book.numbers {
+            by_number.entry(n).or_default().push(book.clone());
         }
     }
 
     for value in by_number.values_mut() {
-        value.sort_by_key(|book| (book.name, book.dir));
+        value.sort_by(|a, b| a.key().cmp(&b.key()));
     }
 
     if !opts.include.is_empty() {
-        by_number.retain(|&&number, _| {
+        by_number.retain(|number, _| {
             opts.include
                 .iter()
-                .any(|predicate| predicate.matches(number))
+                .any(|predicate| predicate.matches(*number))
         });
     }
 
-    let mut state = State {
-        names: names.iter().copied().collect(),
-        ..State::default()
-    };
+    for (number, books) in by_number {
+        let mut catalog = Catalog {
+            number,
+            books,
+            picked: None,
+        };
 
-    for (&number, books) in by_number {
-        if books.len() == 1 {
-            state.picked.insert(state.catalogs.len(), 0);
+        if catalog.books.len() == 1 {
+            catalog.picked = Some(0);
+        } else {
+            catalog.picked = picker.pick(&catalog);
         }
 
-        state.catalogs.push(Catalog { number, books });
+        state.catalogs.push(catalog);
     }
 
-    // Automatically determine name to use.
+    // Automatically determine name to use if possible.
     'name: {
         if let Some(name) = &opts.name {
             state.name = Some(name.clone());
@@ -529,17 +503,6 @@ fn main() -> Result<()> {
         {
             state.name = Some(first.to_string());
             break 'name;
-        }
-    }
-
-    // Automatically seed picks based on options.
-    for (index, catalog) in state.catalogs.iter().enumerate() {
-        if state.picked.contains_key(&index) {
-            continue;
-        }
-
-        if let Some(book) = picker.pick(catalog) {
-            state.picked.insert(index, book);
         }
     }
 
@@ -560,8 +523,8 @@ fn main() -> Result<()> {
             is_error = true;
         }
 
-        for (index, catalog) in state.catalogs.iter().enumerate() {
-            if state.picked.contains_key(&index) {
+        for catalog in &state.catalogs {
+            if catalog.picked.is_some() {
                 continue;
             }
 
@@ -579,7 +542,7 @@ fn main() -> Result<()> {
                 writeln!(
                     o,
                     "  {idx}: {} ({} pages, {} bytes)",
-                    escape(book.name),
+                    escape(&book.name),
                     book.pages.len(),
                     book.bytes(),
                 )?;
@@ -608,12 +571,8 @@ fn main() -> Result<()> {
 
     let name = state.name.context("No name specified for catalog")?;
 
-    for (c, n) in state.picked {
-        let Some((catalog, book)) = state
-            .catalogs
-            .get(c)
-            .and_then(|c| Some((c, c.books.get(n)?)))
-        else {
+    for (c, catalog) in state.catalogs.iter().enumerate() {
+        let Some(book) = catalog.selected() else {
             continue;
         };
 
@@ -716,12 +675,7 @@ fn numbers(mut input: &str) -> impl Iterator<Item = u32> {
 }
 
 /// Generates ComicInfo.xml content if any metadata options are provided.
-fn config_info(
-    opts: &Opts,
-    name: &str,
-    catalog: &Catalog<'_, '_>,
-    book: &Book<'_>,
-) -> Result<String> {
+fn config_info(opts: &Opts, name: &str, catalog: &Catalog, book: &Book) -> Result<String> {
     let mut o = String::new();
 
     writeln!(o, "<?xml version=\"1.0\" encoding=\"utf-8\"?>")?;
