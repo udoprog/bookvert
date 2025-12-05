@@ -1,7 +1,16 @@
 [package]
 name = "bookvert"
+version = "0.0.1"
+authors = ["John-John Tedro <udoprog@tedro.se>"]
 edition = "2024"
-publish = false
+description = "Comic Book Converter by John-John Tedro"
+documentation = "https://docs.rs/bookvert"
+readme = "README.md"
+homepage = "https://github.com/udoprog/bookvert"
+repository = "https://github.com/udoprog/bookvert"
+license = "MIT/Apache-2.0"
+keywords = ["cli", "tui", "comic", "cbz"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.100"
