@@ -4,7 +4,6 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 pub(crate) struct Styles {
     selected_marker: &'static str,
     done_marker: &'static str,
-    empty_marker: &'static str,
     editing_marker: &'static str,
     color_done: Color,
     color_normal: Color,
@@ -16,14 +15,16 @@ pub(crate) struct Styles {
 }
 
 impl Styles {
-    pub(crate) fn marker(&self, selected: bool, done: bool) -> &'static str {
-        if selected {
-            self.selected_marker
-        } else if done {
-            self.done_marker
-        } else {
-            self.empty_marker
-        }
+    pub(crate) fn selected(&self, selected: bool) -> &'static str {
+        if selected { self.selected_marker } else { " " }
+    }
+
+    pub(crate) fn done(&self) -> &'static str {
+        self.done_marker
+    }
+
+    pub(crate) fn no_name(&self) -> &'static str {
+        "(not set)"
     }
 
     pub(crate) fn item_style(&self, selected: bool, done: bool) -> Style {
@@ -114,7 +115,7 @@ impl Styles {
         } else if selected {
             self.selected_marker
         } else {
-            self.empty_marker
+            " "
         }
     }
 }
@@ -123,7 +124,6 @@ impl Styles {
 pub(crate) const STYLES: Styles = Styles {
     selected_marker: "*",
     done_marker: "✓",
-    empty_marker: " ",
     editing_marker: ">",
     color_done: Color::Green,
     color_normal: Color::Reset,

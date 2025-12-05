@@ -100,7 +100,7 @@ impl CatalogsView {
             let total_count = state.catalogs.len();
             let all_picked = picked_count == total_count;
 
-            let marker = STYLES.marker(is_selected, all_picked);
+            let marker = STYLES.selected(is_selected);
             let style = STYLES.normal_item_style(is_selected, all_picked);
 
             Line::from(vec![
@@ -116,14 +116,15 @@ impl CatalogsView {
             let is_selected = self.index == 1;
             let has_name = state.name.is_some();
 
-            let marker = STYLES.marker(is_selected, has_name);
+            let marker = STYLES.selected(is_selected);
             let style = STYLES.item_style(is_selected, has_name);
 
             let name_display = state
                 .name
                 .as_deref()
                 .map(|n| format!("Name: {}", n))
-                .unwrap_or_else(|| "Name: (not set)".to_string());
+                .unwrap_or_else(|| format!("Name: {}", STYLES.no_name()));
+
             Line::from(vec![
                 Span::styled(format!("{marker} "), style),
                 Span::styled(name_display, style),
@@ -140,28 +141,36 @@ impl CatalogsView {
                 selected = Some(items.len());
             }
 
-            let marker = STYLES.marker(is_selected, is_picked);
+            let marker = STYLES.selected(is_selected);
             let style = STYLES.item_style(is_selected, is_picked);
 
-            let picked_info = if let Some(book_idx) = catalog.picked {
-                if let Some(book) = catalog.books.get(book_idx) {
-                    format!(" {}", book.name)
+            let picked_info = if let Some(picked) = catalog.picked {
+                if let Some(book) = catalog.books.get(picked) {
+                    format!("{}", book.name)
                 } else {
                     String::new()
                 }
             } else {
-                " (not selected)".to_string()
+                "(not selected)".to_string()
             };
 
-            let line = Line::from(vec![
-                Span::styled(format!("{marker} "), style),
-                Span::styled(format!("{:03}", catalog.number), style),
-                Span::styled(picked_info, style),
-                Span::styled(
-                    format!(" ({} options)", catalog.books.len()),
-                    STYLES.dim_style(),
+            let mut line = Line::from(vec![Span::styled(
+                format!("{marker} {}. {picked_info}", catalog.number),
+                style,
+            )]);
+
+            if is_picked {
+                line.push_span(format!(" {}", STYLES.done()));
+            }
+
+            line.push_span(Span::styled(
+                format!(
+                    " ({} {})",
+                    catalog.books.len(),
+                    pluralize(catalog.books.len(), "book", "books")
                 ),
-            ]);
+                STYLES.dim_style(),
+            ));
 
             items.push(ListItem::new(line));
 
@@ -273,7 +282,7 @@ impl BooksView {
                 selected = Some(items.len());
             }
 
-            let marker = STYLES.marker(is_selected, is_picked);
+            let marker = STYLES.selected(is_selected);
             let style = STYLES.normal_item_style(is_selected, is_picked);
 
             let dir = book.dir.parent().unwrap_or(Path::new("."));
@@ -376,7 +385,7 @@ impl NameView {
             Char('q') if !editing => {
                 return ViewEvent::PopView;
             }
-            Enter => {
+            Enter | Char('o') => {
                 if self.index == 0 {
                     if editing {
                         let trimmed = self.input.value().trim();
@@ -387,7 +396,7 @@ impl NameView {
                             Some(trimmed.to_string())
                         };
 
-                        self.editing = false;
+                        return ViewEvent::PopView;
                     } else {
                         self.editing = true;
                     }
@@ -447,15 +456,13 @@ impl NameView {
                 selected = Some(items.len());
             }
 
-            let marker = STYLES.marker(is_selected, is_current);
+            let marker = STYLES.selected(is_selected);
             let style = STYLES.normal_item_style(is_selected, is_current);
 
-            let line = Line::from(vec![
-                Span::styled(format!("{marker} "), style),
-                Span::styled(name.to_string(), style),
-            ]);
-
-            items.push(ListItem::new(line));
+            items.push(ListItem::new(Span::styled(
+                format!("{marker} {name}"),
+                style,
+            )));
         }
 
         self.list_state.select(selected);
@@ -621,10 +628,13 @@ impl App {
                 }
                 ViewEvent::PopAndSelectNext => {
                     self.views.pop();
+
                     if let Some(View::Catalogs(v)) = self.views.last_mut()
-                        && let Some(next) = state.catalogs.iter().position(|c| c.picked.is_none())
+                        && let Some(category) =
+                            state.catalogs.iter().position(|c| c.picked.is_none())
                     {
-                        v.index = next.saturating_add(2);
+                        v.index = category.saturating_add(2);
+                        self.views.push(View::Books(BooksView::new(category, 0)));
                     }
                 }
                 ViewEvent::Finish => {
@@ -637,4 +647,8 @@ impl App {
         ratatui::restore();
         Ok(outcome)
     }
+}
+
+fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }

@@ -8,7 +8,7 @@ use core::iter;
 use core::str::FromStr;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
@@ -421,7 +421,6 @@ fn main() -> Result<()> {
 
     let mut books_by_path = BTreeMap::<&Path, _>::new();
     let mut by_number = BTreeMap::<_, Vec<_>>::new();
-    let mut names = BTreeSet::new();
     let mut state = State::default();
 
     for (from, ext) in &files {
@@ -455,7 +454,7 @@ fn main() -> Result<()> {
     for (_, book) in books_by_path {
         let book = Rc::new(book);
 
-        names.insert(book.name.clone());
+        state.names.insert(book.name.clone());
 
         for &n in &book.numbers {
             by_number.entry(n).or_default().push(book.clone());
@@ -497,7 +496,7 @@ fn main() -> Result<()> {
             break 'name;
         }
 
-        let mut it = names.iter();
+        let mut it = state.names.iter();
 
         if let Some(first) = it.next()
             && it.next().is_none()
@@ -517,7 +516,7 @@ fn main() -> Result<()> {
 
             writeln!(o, "Use `--name <name>` to set one name of the series:")?;
 
-            for name in &names {
+            for name in &state.names {
                 writeln!(o, "  {}", escape(name))?;
             }
 
