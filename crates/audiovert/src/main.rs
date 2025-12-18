@@ -1,5 +1,5 @@
 //! A tool to perform batch conversion of audio.
-//! 
+//!
 //! See [`audiovert`] documentation for more information.
 //!
 //! [`audiovert`]: https://crates.io/crates/audiovert

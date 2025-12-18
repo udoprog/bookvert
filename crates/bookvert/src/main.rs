@@ -1,5 +1,5 @@
 //! A tool to perform batch conversion of audio.
-//! 
+//!
 //! See [`bookvert`] documentation for more information.
 //!
 //! [`bookvert`]: https://crates.io/crates/bookvert
