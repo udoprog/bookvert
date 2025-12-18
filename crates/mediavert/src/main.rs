@@ -25,9 +25,14 @@ enum Command {
     Music(audiovert::cli::Audiovert),
 }
 
+const VERSION: &str = match option_env!("MEDIAVERT_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// A tool to perform batch conversion of media.
 #[derive(Parser)]
-#[command(author, version, about, max_term_width = 80)]
+#[command(author, version, about, max_term_width = 80, version = VERSION)]
 struct Opts {
     #[command(subcommand)]
     command: Command,

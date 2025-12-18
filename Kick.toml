@@ -1,14 +1,14 @@
 [[package.files]]
 source = "target/release/bookvert"
-dest = "usr/bin/bookvert"
+dest = "usr/bin"
 mode = "0755"
 
 [[package.files]]
 source = "target/release/audiovert"
-dest = "usr/bin/audiovert"
+dest = "usr/bin"
 mode = "0755"
 
 [[package.files]]
 source = "target/release/mediavert"
-dest = "usr/bin/mediavert"
+dest = "usr/bin"
 mode = "0755"
