@@ -13,7 +13,9 @@ use crate::format::Format;
 use crate::meta;
 use crate::out::{Out, blank, error, info};
 use crate::shell;
-use crate::tasks::{MatchingConversion, PathError, Task, TaskKind, Tasks, TransferKind};
+use crate::tasks::{
+    MatchingConversion, PathError, Task, TaskKind, Tasks, TransferKind, Unsupported,
+};
 
 /// Configuration for conversions.
 pub(crate) struct Config {
@@ -42,172 +44,214 @@ impl Config {
         let mut tag_errors = Vec::new();
         let mut tag_items = Vec::new();
         let mut to_formats = BTreeSet::new();
+        let mut sources = Vec::new();
 
         for path in &self.paths {
             for f in ignore::Walk::new(path) {
                 let entry = f?;
 
-                let from_path = entry.path();
+                let walked = entry.path();
 
-                if !from_path.is_file() {
+                if !walked.is_file() {
                     continue;
                 }
 
-                let Some(ext) = from_path.extension().and_then(|s| s.to_str()) else {
+                let Some(ext) = walked.extension().and_then(|s| s.to_str()) else {
                     continue;
                 };
 
-                let Some(from) = Format::from_ext(ext) else {
-                    if let Some(archive) = Archive::from_ext(ext) {
-                        dbg!(archive);
+                if let Some(archive) = Archive::from_ext(ext) {
+                    match archive {
+                        Archive::Rar => {
+                            let archive = unrar::Archive::new(walked);
+                            let open_archive = archive.open_for_listing()?;
+
+                            for e in open_archive {
+                                let e = e?;
+
+                                if e.filename.is_absolute() {
+                                    continue;
+                                }
+
+                                sources.push(Source {
+                                    origin: Origin::Archive(ArchiveOrigin {
+                                        kind: Archive::Rar,
+                                        archive_path: walked.to_path_buf(),
+                                        path: e.filename.clone(),
+                                    }),
+                                    path: e.filename.clone(),
+                                });
+                            }
+                        }
+                        Archive::Zip => {}
+                    }
+                } else {
+                    let source = Source {
+                        origin: Origin::File,
+                        path: walked.to_path_buf(),
+                    };
+
+                    sources.push(source);
+                }
+
+                for source in sources.drain(..) {
+                    let Some(from) = source.ext().and_then(Format::from_ext) else {
+                        tasks.unsupported.push(Unsupported {
+                            source,
+                            ext: ext.to_string(),
+                        });
+
                         continue;
                     };
 
-                    tasks
-                        .unsupported_extensions
-                        .push((from_path.to_path_buf(), ext.to_string()));
-                    continue;
-                };
+                    to_formats.clear();
 
-                to_formats.clear();
+                    for conversion in &self.conversion {
+                        to_formats.extend(conversion.to_format(from));
+                    }
 
-                for conversion in &self.conversion {
-                    to_formats.extend(conversion.to_format(from));
-                }
-
-                if !to_formats.is_empty() && self.verbose {
-                    tasks.matching_conversions.push(MatchingConversion {
-                        from_path: from_path.to_path_buf(),
-                        from: from,
-                        to_formats: to_formats.iter().cloned().collect(),
-                    });
-                }
-
-                let id_parts = if self.meta {
-                    let id_parts = meta::Parts::from_path(
-                        from_path,
-                        &mut tag_errors,
-                        (self.meta_dump || self.meta_dump_error).then_some(&mut tag_items),
-                    );
-
-                    let has_errors = !tag_errors.is_empty();
-
-                    if !tag_errors.is_empty() {
-                        tasks.errors.push(PathError {
-                            path: from_path.to_path_buf(),
-                            messages: tag_errors.drain(..).collect(),
+                    if !to_formats.is_empty() && self.verbose {
+                        tasks.matching_conversions.push(MatchingConversion {
+                            source: source.clone(),
+                            from,
+                            to_formats: to_formats.iter().cloned().collect(),
                         });
                     }
 
-                    if !tag_items.is_empty() {
-                        if self.meta_dump || (self.meta_dump_error && has_errors) {
-                            tasks.meta_dumps.push(meta::Dump {
-                                path: from_path.to_path_buf(),
-                                items: tag_items.drain(..).collect(),
+                    let id_parts = if self.meta {
+                        let id_parts = meta::Parts::from_path(
+                            &source,
+                            &mut tag_errors,
+                            (self.meta_dump || self.meta_dump_error).then_some(&mut tag_items),
+                        );
+
+                        let id_parts = match id_parts {
+                            Ok(id_parts) => Some(id_parts),
+                            Err(e) => {
+                                tag_errors.push(format!("failed to read tags: {e}"));
+                                None
+                            }
+                        };
+
+                        let has_errors = !tag_errors.is_empty();
+
+                        if !tag_errors.is_empty() {
+                            tasks.errors.push(PathError {
+                                source: source.clone(),
+                                messages: tag_errors.drain(..).collect(),
                             });
                         }
 
-                        tag_items.clear();
-                    }
-
-                    id_parts
-                } else {
-                    None
-                };
-
-                for &to in &to_formats {
-                    let mut pre_remove = Vec::new();
-
-                    let to_path = if let Some(to_dir) = &self.to_dir {
-                        match &id_parts {
-                            Some(id_parts) => {
-                                let mut to_path = to_dir.to_path_buf();
-                                id_parts.append_to(&mut to_path);
-                                to_path.add_extension(to.ext());
-                                to_path
+                        if !tag_items.is_empty() {
+                            if self.meta_dump || (self.meta_dump_error && has_errors) {
+                                tasks.meta_dumps.push(meta::Dump {
+                                    source: source.clone(),
+                                    items: tag_items.drain(..).collect(),
+                                });
                             }
-                            None => {
-                                let Some(suffix) = from_path.strip_prefix(path).ok() else {
-                                    tasks.errors.push(PathError {
-                                        path: from_path.to_path_buf(),
-                                        messages: vec!["Failed to get suffix for path".to_string()],
-                                    });
 
-                                    continue;
-                                };
-
-                                let mut to_path = to_dir.join(suffix);
-                                to_path.set_extension(to.ext());
-                                to_path
-                            }
+                            tag_items.clear();
                         }
+
+                        id_parts
                     } else {
-                        match &id_parts {
-                            Some(id_parts) => {
-                                let mut to_path = path.to_path_buf();
-                                id_parts.append_to(&mut to_path);
-                                to_path.add_extension(to.ext());
-                                to_path
-                            }
-                            None => {
-                                let mut to_path = from_path.to_path_buf();
-                                to_path.set_extension(to.ext());
-                                to_path
-                            }
-                        }
+                        None
                     };
 
-                    if from_path == to_path {
-                        continue;
-                    }
+                    for &to in &to_formats {
+                        let mut pre_remove = Vec::new();
 
-                    let exists = if to_path.exists() {
-                        if !self.force {
-                            tasks
-                                .already_exists
-                                .push((from_path.to_path_buf(), to_path.clone()));
-                            true
+                        let to_path = if let Some(to_dir) = &self.to_dir {
+                            match &id_parts {
+                                Some(id_parts) => {
+                                    let mut to_path = to_dir.to_path_buf();
+                                    id_parts.append_to(&mut to_path);
+                                    to_path.add_extension(to.ext());
+                                    to_path
+                                }
+                                None => {
+                                    let Some(suffix) = source.path.strip_prefix(path).ok() else {
+                                        tasks.errors.push(PathError {
+                                            source: source.clone(),
+                                            messages: vec![
+                                                "Failed to get suffix for path".to_string(),
+                                            ],
+                                        });
+
+                                        continue;
+                                    };
+
+                                    let mut to_path = to_dir.join(suffix);
+                                    to_path.set_extension(to.ext());
+                                    to_path
+                                }
+                            }
                         } else {
-                            pre_remove.push(("destination path (--force)", to_path.clone()));
-                            false
-                        }
-                    } else {
-                        false
-                    };
+                            match &id_parts {
+                                Some(id_parts) => {
+                                    let mut to_path = path.to_path_buf();
+                                    id_parts.append_to(&mut to_path);
+                                    to_path.add_extension(to.ext());
+                                    to_path
+                                }
+                                None => {
+                                    let mut to_path = source.path.to_path_buf();
+                                    to_path.set_extension(to.ext());
+                                    to_path
+                                }
+                            }
+                        };
 
-                    let kind = if from == to && !self.forced_bitrates.contains(&from) {
-                        TaskKind::Transfer {
-                            kind: if self.r#move {
-                                TransferKind::Move
+                        if source.path == to_path {
+                            continue;
+                        }
+
+                        let exists = if to_path.exists() {
+                            if !self.force {
+                                tasks.already_exists.push((source.clone(), to_path.clone()));
+                                true
                             } else {
-                                TransferKind::Link
-                            },
-                        }
-                    } else {
-                        let part_path = to_path.with_added_extension(&self.part_ext);
+                                pre_remove.push(("destination path (--force)", to_path.clone()));
+                                false
+                            }
+                        } else {
+                            false
+                        };
 
-                        if part_path.exists() {
-                            pre_remove.push(("partial conversion file", part_path.clone()));
-                        }
+                        let kind = if from == to && !self.forced_bitrates.contains(&from) {
+                            TaskKind::Transfer {
+                                kind: if self.r#move {
+                                    TransferKind::Move
+                                } else {
+                                    TransferKind::Link
+                                },
+                            }
+                        } else {
+                            let part_path = to_path.with_added_extension(&self.part_ext);
 
-                        TaskKind::Convert {
-                            part_path,
-                            from,
-                            to,
-                            converted: exists,
-                        }
-                    };
+                            if part_path.exists() {
+                                pre_remove.push(("partial conversion file", part_path.clone()));
+                            }
 
-                    let index = tasks.tasks.len();
+                            TaskKind::Convert {
+                                part_path,
+                                from,
+                                to,
+                                converted: exists,
+                            }
+                        };
 
-                    tasks.tasks.push(Task {
-                        index,
-                        kind,
-                        from_path: from_path.to_path_buf(),
-                        to_path,
-                        moved: exists,
-                        pre_remove,
-                    });
+                        let index = tasks.tasks.len();
+
+                        tasks.tasks.push(Task {
+                            index,
+                            kind,
+                            source: source.clone(),
+                            to_path,
+                            moved: exists,
+                            pre_remove,
+                        });
+                    }
                 }
             }
         }
@@ -244,5 +288,102 @@ impl Config {
         } else {
             Ok(true)
         }
+    }
+}
+
+/// Origin of a file inside an archive.
+#[derive(Clone)]
+pub(crate) struct ArchiveOrigin {
+    /// Kind of the archive.
+    pub(crate) kind: Archive,
+    /// Path to the archive.
+    pub(crate) archive_path: PathBuf,
+    /// Path inside the archive.
+    pub(crate) path: PathBuf,
+}
+
+impl ArchiveOrigin {
+    pub(crate) fn contents(&self) -> Result<Vec<u8>> {
+        match self.kind {
+            Archive::Rar => {
+                let archive = unrar::Archive::new(&self.archive_path);
+                let mut archive = archive.open_for_processing()?;
+
+                while let Some(a) = archive.read_header()? {
+                    if a.entry().filename == self.path {
+                        let (contents, _) = a.read()?;
+                        return Ok(contents);
+                    }
+
+                    archive = a.skip()?;
+                }
+
+                Err(anyhow::anyhow!(
+                    "file {:?} not found in archive {:?}",
+                    self.path,
+                    self.archive_path
+                ))
+            }
+            Archive::Zip => Err(anyhow::anyhow!("zip archives not supported yet")),
+        }
+    }
+}
+
+/// Origin of a source file.
+#[derive(Clone)]
+pub(crate) enum Origin {
+    /// A regular file in the filesystem.
+    File,
+    /// A file inside an archive.
+    Archive(ArchiveOrigin),
+}
+
+impl Origin {
+    /// Check if the origin is a regular file.
+    #[inline]
+    pub(crate) fn is_file(&self) -> bool {
+        matches!(self, Origin::File)
+    }
+}
+
+/// A source file for conversion or transfer.
+#[derive(Clone)]
+pub(crate) struct Source {
+    pub(crate) origin: Origin,
+    pub(crate) path: PathBuf,
+}
+
+impl Source {
+    /// Get the contents of the source file.
+    pub(crate) fn contents(&self) -> Result<Vec<u8>> {
+        match &self.origin {
+            Origin::File => Ok(fs::read(&self.path)?),
+            Origin::Archive(archive) => archive.contents(),
+        }
+    }
+
+    /// Get the extension of the source file.
+    pub(crate) fn ext(&self) -> Option<&str> {
+        self.path.extension().and_then(|s| s.to_str())
+    }
+
+    /// Dump source information.
+    pub(crate) fn dump(&self, o: &mut Out<'_>) -> Result<()> {
+        match &self.origin {
+            Origin::File => {
+                blank!(o, "path: {}", shell::escape(self.path.as_os_str()));
+            }
+            Origin::Archive(archive) => {
+                blank!(
+                    o,
+                    "{}: {}",
+                    archive.kind,
+                    shell::escape(archive.archive_path.as_os_str())
+                );
+                blank!(o, "path: {}", shell::escape(archive.path.as_os_str()));
+            }
+        }
+
+        Ok(())
     }
 }

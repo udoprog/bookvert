@@ -4,8 +4,9 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -13,12 +14,14 @@ use termcolor::{ColorChoice, StandardStream};
 
 use crate::bitrates::Bitrates;
 use crate::condition::{Condition, FromCondition, ToCondition};
-use crate::config::Config;
+use crate::config::{Config, Origin, Source};
 use crate::format::Format;
 use crate::out::{Colors, Out, blank, error, info, warn};
 use crate::set_bit_rate::SetBitRate;
 use crate::shell::{self, FormatCommand};
-use crate::tasks::{MatchingConversion, TaskKind, Tasks, TransferKind, Trash, TrashWhat};
+use crate::tasks::{
+    MatchingConversion, TaskKind, Tasks, TransferKind, Trash, TrashWhat, Unsupported,
+};
 
 const PART: &str = "part";
 
@@ -208,22 +211,23 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
 
     config.populate(&mut tasks)?;
 
-    for (path, ext) in tasks.unsupported_extensions.drain(..) {
+    for Unsupported { source, ext } in tasks.unsupported.drain(..) {
         warn!(o, "Unsupported extension: {ext}");
         let mut o = o.indent(1);
-        blank!(o, "Path: {}", shell::escape(path.as_os_str()));
+        source.dump(&mut o)?;
     }
 
     for (from, to) in tasks.already_exists.drain(..) {
         warn!(o => v, "already exists (--force to remove):");
         let mut o = o.indent(1);
-        blank!(o => v, "from : {}", shell::escape(from.as_os_str()));
-        blank!(o => v, "to   : {}", shell::escape(to.as_os_str()));
+        from.dump(&mut o)?;
+        blank!(o => v, "to: {}", shell::escape(to.as_os_str()));
     }
 
     for e in &tasks.errors {
-        error!(o, "Error: {}", shell::escape(e.path.as_os_str()));
+        error!(o, "Error:");
         let mut o = o.indent(1);
+        e.source.dump(&mut o)?;
 
         for m in &e.messages {
             error!(o, "{m}");
@@ -239,7 +243,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
     }
 
     for MatchingConversion {
-        from_path,
+        source,
         from,
         to_formats,
     } in tasks.matching_conversions.drain(..)
@@ -252,7 +256,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
 
         info!(o => v, "Found matching conversions: {from} -> {to_formats}");
         let mut o = o.indent(1);
-        blank!(o => v, "path: {}", shell::escape(from_path.as_os_str()));
+        source.dump(&mut o)?;
     }
 
     let total = tasks.tasks.len();
@@ -265,8 +269,8 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
         info!(o, "Task #{}/#{total}: {}", c.index, c.kind);
         let mut o = o.indent(1);
 
-        blank!(o, "from : {}", shell::escape(c.from_path.as_os_str()));
-        blank!(o, "to   : {}", shell::escape(c.to_path.as_os_str()));
+        c.source.dump(&mut o)?;
+        blank!(o, "to: {}", shell::escape(c.to_path.as_os_str()));
 
         for (reason, path) in c.pre_remove.drain(..) {
             info!(o, "removing {reason}");
@@ -293,23 +297,29 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                 ..
             } => {
                 if !*converted {
-                    let mut cmd = Command::new(&config.ffmpeg);
-                    cmd.args(["-hide_banner", "-loglevel", "error"]);
-                    cmd.args([OsStr::new("-i"), c.from_path.as_os_str()]);
-                    to.bitrate(config, &mut cmd);
-                    cmd.args(["-map_metadata", "0", "-id3v2_version", "3"]);
-                    cmd.args(["-f", to.ffmpeg_format()]);
-                    cmd.arg(part_path);
+                    let (argument, pipe) = match &c.source.origin {
+                        Origin::File => (c.source.path.as_os_str(), false),
+                        Origin::Archive(_) => (OsStr::new("pipe:"), true),
+                    };
 
-                    let mut f = FormatCommand::new(&cmd);
+                    let mut command = Command::new(&config.ffmpeg);
+                    command.args(["-hide_banner", "-loglevel", "error"]);
+                    command.args([OsStr::new("-i"), argument]);
+                    to.bitrate(config, &mut command);
+                    command.args(["-map_metadata", "0", "-id3v2_version", "3"]);
+                    command.args(["-f", to.ffmpeg_format()]);
+                    command.arg(part_path);
+
+                    let mut f = FormatCommand::new(&command);
 
                     if !config.verbose {
-                        f.insert_replacement(config.ffmpeg.as_os_str(), "<ffmpeg>");
-                        f.insert_replacement(c.from_path.as_os_str(), "<from>");
-                        f.insert_replacement(
-                            part_path.as_os_str(),
-                            format!("<to>.{}", config.part_ext),
-                        );
+                        f.replace(config.ffmpeg.as_os_str(), "<ffmpeg>");
+
+                        if !pipe {
+                            f.replace(argument, "<from>");
+                        }
+
+                        f.replace(part_path.as_os_str(), format!("<to>.{}", config.part_ext));
                     }
 
                     if !config.make_dir(&mut o, "partial", part_path)? {
@@ -321,15 +331,29 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                         let mut o = o.indent(1);
 
                         if !config.dry_run {
-                            let status = match cmd.status() {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    error!(o, "{e}");
-                                    continue;
-                                }
-                            };
+                            if pipe {
+                                command.stdin(Stdio::piped());
 
-                            *converted = status.success();
+                                let status = match write_source_to_stdin(&mut command, &c.source) {
+                                    Ok(status) => status,
+                                    Err(e) => {
+                                        error!(o, "{e}");
+                                        continue;
+                                    }
+                                };
+
+                                *converted = status.success();
+                            } else {
+                                let status = match command.status() {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        error!(o, "{e}");
+                                        continue;
+                                    }
+                                };
+
+                                *converted = status.success();
+                            }
                         } else {
                             *converted = true;
                         }
@@ -344,8 +368,8 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                         let mut o = o.indent(1);
 
                         if config.verbose {
-                            blank!(o, "from : {}", shell::escape(part_path.as_os_str()));
-                            blank!(o, "to   : {}", shell::escape(c.to_path.as_os_str()));
+                            blank!(o, "from: {}", shell::escape(part_path.as_os_str()));
+                            blank!(o, "to: {}", shell::escape(c.to_path.as_os_str()));
                         }
 
                         if !config.dry_run {
@@ -367,16 +391,22 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                     }
 
                     if config.verbose {
-                        blank!(o, "from : {}", shell::escape(c.from_path.as_os_str()));
-                        blank!(o, "to   : {}", shell::escape(c.to_path.as_os_str()));
+                        c.source.dump(&mut o)?;
+                        blank!(o, "to: {}", shell::escape(c.to_path.as_os_str()));
                     } else {
                         blank!(o, "{} <from> <to>", kind.symbolic_command());
                     }
 
                     if !config.dry_run {
-                        let result = match kind {
-                            TransferKind::Link => fs::hard_link(&c.from_path, &c.to_path),
-                            TransferKind::Move => fs::rename(&c.from_path, &c.to_path),
+                        let result = match &c.source.origin {
+                            Origin::Archive(archive) => {
+                                let contents = archive.contents()?;
+                                fs::write(&c.to_path, contents)
+                            }
+                            Origin::File => match kind {
+                                TransferKind::Link => fs::hard_link(&c.source.path, &c.to_path),
+                                TransferKind::Move => fs::rename(&c.source.path, &c.to_path),
+                            },
                         };
 
                         if let Err(e) = result {
@@ -409,9 +439,13 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
             continue;
         }
 
+        if !c.source.origin.is_file() {
+            continue;
+        }
+
         let new;
 
-        let file_name = match c.from_path.file_name() {
+        let file_name = match c.source.path.file_name() {
             Some(name) => name,
             None => {
                 new = OsString::from(format!("file{}", n));
@@ -422,7 +456,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
 
         tasks.to_trash.push(Trash {
             what: TrashWhat::SourceFile,
-            path: c.from_path.clone(),
+            path: c.source.path.clone(),
             name: file_name.to_owned(),
         });
     }
@@ -450,8 +484,8 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
 
         info!(o, "Trashing {what}");
         let mut o = o.indent(1);
-        blank!(o, "from : {}", shell::escape(path.as_os_str()));
-        blank!(o, "to   : {}", shell::escape(trash_path.as_os_str()));
+        blank!(o, "from: {}", shell::escape(path.as_os_str()));
+        blank!(o, "to: {}", shell::escape(trash_path.as_os_str()));
 
         if !config.dry_run
             && let Err(e) = fs::rename(&path, &trash_path)
@@ -494,4 +528,14 @@ fn is_empty_dir(path: &PathBuf) -> bool {
     };
 
     entries.next().is_none()
+}
+
+fn write_source_to_stdin(command: &mut Command, source: &Source) -> Result<ExitStatus> {
+    let mut child = command.spawn().context("spawning process")?;
+    let contents = source.contents().context("reading source contents")?;
+    let mut stdin = child.stdin.take().context("missing stdin")?;
+    stdin.write_all(&contents).context("writing to stdin")?;
+    stdin.flush().context("flushing stdin")?;
+    drop(stdin);
+    child.wait().context("waiting for process")
 }

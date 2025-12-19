@@ -1,13 +1,15 @@
 use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::io::Cursor;
+use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use jiff::civil::Date;
-use lofty::file::TaggedFileExt;
+use lofty::file::{FileType, TaggedFile, TaggedFileExt};
+use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue, TagItem};
 
+use crate::config::{Origin, Source};
 use crate::out::{Out, blank, info};
-use crate::shell;
 
 pub(crate) struct Parts {
     year: i16,
@@ -21,25 +23,25 @@ pub(crate) struct Parts {
 
 impl Parts {
     pub(crate) fn from_path(
-        path: &Path,
+        source: &Source,
         errors: &mut Vec<String>,
         tag_items: Option<&mut Vec<TagItem>>,
-    ) -> Option<Self> {
-        let file = match lofty::read_from_path(path) {
-            Ok(tag) => tag,
-            Err(e) => {
-                errors.push(format!("failed to read tags: {e}"));
-                return None;
+    ) -> Result<Self> {
+        let file: TaggedFile = match &source.origin {
+            Origin::File => lofty::read_from_path(&source.path)?,
+            Origin::Archive(archive) => {
+                let contents = archive.contents()?;
+                let mut probe = Probe::new(Cursor::new(contents));
+
+                if let Some(file_type) = source.ext().and_then(FileType::from_ext) {
+                    probe = probe.set_file_type(file_type);
+                }
+
+                probe.read()?
             }
         };
 
-        let tag = match file.primary_tag() {
-            Some(tag) => tag,
-            None => {
-                errors.push("missing primary tag".to_string());
-                return None;
-            }
-        };
+        let tag = file.primary_tag().context("missing primary tag")?;
 
         if let Some(tag_items) = tag_items {
             for item in tag.items() {
@@ -153,15 +155,19 @@ impl Parts {
             Some((number, total))
         };
 
-        Some(Self {
-            year: year?,
-            artist: artist?.trim().to_owned(),
-            album: album?.to_owned(),
-            track: track?,
-            title: title?.trim().to_owned(),
-            media_type: media_type.map(str::to_owned),
-            set,
-        })
+        let value = || {
+            Some(Self {
+                year: year?,
+                artist: artist?.trim().to_owned(),
+                album: album?.to_owned(),
+                track: track?,
+                title: title?.trim().to_owned(),
+                media_type: media_type.map(str::to_owned),
+                set,
+            })
+        };
+
+        value().context("incomplete tag information")
     }
 
     /// Append parts to a buffer.
@@ -281,14 +287,16 @@ fn sanitize(s: &str) -> Cow<'_, str> {
 }
 
 pub(super) struct Dump {
-    pub(super) path: PathBuf,
+    pub(super) source: Source,
     pub(super) items: Vec<TagItem>,
 }
 
 impl Dump {
     pub(crate) fn dump(&self, o: &mut Out<'_>) -> Result<()> {
-        info!(o, "Tags: {}", shell::escape(self.path.as_os_str()));
+        info!(o, "Tags:");
         let mut o = o.indent(1);
+
+        self.source.dump(&mut o)?;
 
         for item in &self.items {
             dump_tag_item(&mut o, item)?;

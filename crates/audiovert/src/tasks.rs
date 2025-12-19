@@ -3,6 +3,7 @@ use core::fmt;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::config::Source;
 use crate::format::Format;
 use crate::meta::Dump;
 
@@ -12,8 +13,8 @@ pub(crate) struct Tasks {
     pub(crate) matching_conversions: Vec<MatchingConversion>,
     pub(crate) tasks: Vec<Task>,
     pub(crate) to_trash: Vec<Trash>,
-    pub(crate) already_exists: Vec<(PathBuf, PathBuf)>,
-    pub(crate) unsupported_extensions: Vec<(PathBuf, String)>,
+    pub(crate) already_exists: Vec<(Source, PathBuf)>,
+    pub(crate) unsupported: Vec<Unsupported>,
 }
 
 impl Tasks {
@@ -25,7 +26,7 @@ impl Tasks {
             tasks: Vec::new(),
             to_trash: Vec::new(),
             already_exists: Vec::new(),
-            unsupported_extensions: Vec::new(),
+            unsupported: Vec::new(),
         }
     }
 }
@@ -94,7 +95,7 @@ impl fmt::Display for TaskKind {
 
 /// A collection of errors associated with a particular path.
 pub(crate) struct PathError {
-    pub(crate) path: PathBuf,
+    pub(crate) source: Source,
     pub(crate) messages: Vec<String>,
 }
 
@@ -102,7 +103,7 @@ pub(crate) struct PathError {
 pub(crate) struct Task {
     pub(crate) index: usize,
     pub(crate) kind: TaskKind,
-    pub(crate) from_path: PathBuf,
+    pub(crate) source: Source,
     pub(crate) to_path: PathBuf,
     pub(crate) moved: bool,
     pub(crate) pre_remove: Vec<(&'static str, PathBuf)>,
@@ -115,7 +116,7 @@ impl Task {
 }
 
 pub(crate) struct MatchingConversion {
-    pub(crate) from_path: PathBuf,
+    pub(crate) source: Source,
     pub(crate) from: Format,
     pub(crate) to_formats: Vec<Format>,
 }
@@ -137,4 +138,9 @@ pub(crate) struct Trash {
     pub(crate) what: TrashWhat,
     pub(crate) path: PathBuf,
     pub(crate) name: OsString,
+}
+
+pub(crate) struct Unsupported {
+    pub(crate) source: Source,
+    pub(crate) ext: String,
 }

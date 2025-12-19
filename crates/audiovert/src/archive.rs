@@ -3,6 +3,7 @@ use core::str::FromStr;
 
 pub(crate) struct ArchiveErr;
 
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum Archive {
     Zip,
     Rar,

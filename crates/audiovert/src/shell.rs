@@ -71,7 +71,7 @@ impl<'a> FormatCommand<'a> {
     }
 
     /// Insert a replacement for a given argument.
-    pub(crate) fn insert_replacement(
+    pub(crate) fn replace(
         &mut self,
         key: &'a (impl AsRef<OsStr> + ?Sized),
         value: impl Into<Cow<'a, str>>,
