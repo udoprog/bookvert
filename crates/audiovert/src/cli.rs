@@ -15,7 +15,7 @@ use termcolor::{ColorChoice, StandardStream};
 
 use crate::bitrates::Bitrates;
 use crate::condition::{Condition, FromCondition, ToCondition};
-use crate::config::{ArchiveId, Archives, Config, Origin};
+use crate::config::{ArchiveId, Archives, Config, Source};
 use crate::format::Format;
 use crate::out::{Colors, Out, blank, error, info, warn};
 use crate::set_bit_rate::SetBitRate;
@@ -312,9 +312,9 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                 ..
             } => {
                 if !*converted {
-                    let (argument, archive) = match &c.source.origin {
-                        Origin::File { path, .. } => (path.as_os_str(), None),
-                        Origin::Archive { archive, path } => {
+                    let (argument, archive) = match &c.source {
+                        Source::File { path, .. } => (path.as_os_str(), None),
+                        Source::Archive { archive, path } => {
                             (OsStr::new("pipe:"), Some((*archive, path)))
                         }
                     };
@@ -452,9 +452,9 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
             continue;
         }
 
-        let path = match &c.source.origin {
-            Origin::Archive { .. } => continue,
-            Origin::File { path, .. } => path,
+        let path = match &c.source {
+            Source::Archive { .. } => continue,
+            Source::File { path, .. } => path,
         };
 
         let new;

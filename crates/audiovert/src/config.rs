@@ -74,7 +74,7 @@ impl Config {
                 };
 
                 if let Some(kind) = Archive::from_ext(ext) {
-                    let archive_id = tasks.archives.push(ArchiveOrigin {
+                    let archive_id = tasks.archives.push(SourceArchive {
                         kind,
                         path: walked.to_path_buf(),
                         absolute_path: fs::canonicalize(walked)?,
@@ -107,22 +107,18 @@ impl Config {
                         };
 
                         if ok {
-                            sources.push(Source {
-                                origin: Origin::Archive {
-                                    archive: archive_id,
-                                    path: path.to_owned(),
-                                },
+                            sources.push(Source::Archive {
+                                archive: archive_id,
+                                path: path.to_owned(),
                             });
                         }
 
                         Ok(())
                     })?;
                 } else {
-                    let source = Source {
-                        origin: Origin::File {
-                            path: walked.to_path_buf(),
-                            absolute_path: fs::canonicalize(walked)?,
-                        },
+                    let source = Source::File {
+                        path: walked.to_path_buf(),
+                        absolute_path: fs::canonicalize(walked)?,
                     };
 
                     sources.push(source);
@@ -249,15 +245,15 @@ impl Config {
 
                         let kind = if from == to && !self.forced_bitrates.contains(&from) {
                             TaskKind::Transfer {
-                                kind: match &source.origin {
-                                    Origin::File { .. } => {
+                                kind: match source {
+                                    Source::File { .. } => {
                                         if self.r#move {
                                             TransferKind::Move
                                         } else {
                                             TransferKind::Link
                                         }
                                     }
-                                    Origin::Archive { .. } => TransferKind::Copy,
+                                    Source::Archive { .. } => TransferKind::Copy,
                                 },
                             }
                         } else {
@@ -325,9 +321,11 @@ impl Config {
     }
 }
 
-/// Origin of a file inside an archive.
+/// The location and characteristics of a source archive.
+///
+/// This is referenced by an [`ArchiveId`].
 #[derive(Clone)]
-pub(crate) struct ArchiveOrigin {
+pub(crate) struct SourceArchive {
     /// Kind of the archive.
     pub(crate) kind: Archive,
     /// Path to the archive.
@@ -336,7 +334,7 @@ pub(crate) struct ArchiveOrigin {
     pub(crate) absolute_path: PathBuf,
 }
 
-impl ArchiveOrigin {
+impl SourceArchive {
     /// Get the contents of a file inside the archive.
     pub(crate) fn contents(&self, path: &RelativePath) -> Result<Vec<u8>> {
         if let Some(contents) = self.kind.contents(&self.path, path)? {
@@ -348,25 +346,6 @@ impl ArchiveOrigin {
             self.path.display()
         ))
     }
-}
-
-/// Origin of a source file.
-#[derive(Clone)]
-pub(crate) enum Origin {
-    /// A regular file in the filesystem.
-    File {
-        /// The path to the file.
-        path: PathBuf,
-        /// The absolute path to the file.
-        absolute_path: PathBuf,
-    },
-    /// A file inside an archive.
-    Archive {
-        /// Archive identifier.
-        archive: ArchiveId,
-        /// Path inside the archive.
-        path: RelativePathBuf,
-    },
 }
 
 #[derive(Clone, Copy)]
@@ -381,7 +360,7 @@ impl fmt::Display for ArchiveId {
 
 /// Collection of archives.
 pub(crate) struct Archives {
-    archives: Vec<ArchiveOrigin>,
+    archives: Vec<SourceArchive>,
 }
 
 impl Archives {
@@ -392,7 +371,7 @@ impl Archives {
         }
     }
 
-    pub(crate) fn get(&self, id: ArchiveId) -> Result<&ArchiveOrigin> {
+    pub(crate) fn get(&self, id: ArchiveId) -> Result<&SourceArchive> {
         let Some(archive) = self.archives.get(id.0) else {
             return Err(anyhow!("invalid archive id: {id}"));
         };
@@ -402,7 +381,7 @@ impl Archives {
 
     /// Push an archive to the collection.
     #[inline]
-    pub(crate) fn push(&mut self, archive: ArchiveOrigin) -> ArchiveId {
+    pub(crate) fn push(&mut self, archive: SourceArchive) -> ArchiveId {
         let id = ArchiveId(self.archives.len());
         self.archives.push(archive);
         id
@@ -420,8 +399,21 @@ impl Archives {
 
 /// A source file for conversion or transfer.
 #[derive(Clone)]
-pub(crate) struct Source {
-    pub(crate) origin: Origin,
+pub(crate) enum Source {
+    /// A regular file in the filesystem.
+    File {
+        /// The path to the file.
+        path: PathBuf,
+        /// The absolute path to the file.
+        absolute_path: PathBuf,
+    },
+    /// A file inside an archive.
+    Archive {
+        /// Archive identifier.
+        archive: ArchiveId,
+        /// Path inside the archive.
+        path: RelativePathBuf,
+    },
 }
 
 impl Source {
@@ -432,15 +424,15 @@ impl Source {
         archives: &Archives,
         to_path: &mut PathBuf,
     ) -> Result<()> {
-        match &self.origin {
-            Origin::File { path, .. } => {
+        match self {
+            Self::File { path, .. } => {
                 let Ok(suffix) = path.strip_prefix(base) else {
                     bail!("invalid base path");
                 };
 
                 to_path.push(suffix);
             }
-            Origin::Archive { archive, path } => {
+            Self::Archive { archive, path } => {
                 let archive = archives.get(*archive).context("no archive directory")?;
 
                 let Ok(suffix) = archive.path.strip_prefix(base) else {
@@ -474,9 +466,9 @@ impl Source {
 
     /// Convert an in-place source path to a regular filesystem path.
     pub(crate) fn to_path(&self, archives: &Archives) -> Result<PathBuf> {
-        match &self.origin {
-            Origin::File { path, .. } => Ok(path.clone()),
-            Origin::Archive { archive, path } => {
+        match self {
+            Self::File { path, .. } => Ok(path.clone()),
+            Self::Archive { archive, path } => {
                 let archive = archives.get(*archive).context("no archive directory")?;
 
                 let mut to_path = archive.path.to_owned();
@@ -505,8 +497,8 @@ impl Source {
     }
 
     pub(crate) fn move_to(&self, archives: &Archives, to: &Path, kind: TransferKind) -> Result<()> {
-        match &self.origin {
-            Origin::Archive { archive, path } => match kind {
+        match self {
+            Self::Archive { archive, path } => match kind {
                 TransferKind::Link => bail!("cannot link from archive"),
                 TransferKind::Move => bail!("cannot move from archive"),
                 TransferKind::Copy => {
@@ -514,7 +506,7 @@ impl Source {
                     fs::write(to, contents).context("writing file")?;
                 }
             },
-            Origin::File { path, .. } => match kind {
+            Self::File { path, .. } => match kind {
                 TransferKind::Link => {
                     fs::hard_link(path, to).context("creating hard link")?;
                 }
@@ -532,22 +524,22 @@ impl Source {
 
     /// Get the extension of the source file.
     pub(crate) fn ext(&self) -> Option<&str> {
-        match &self.origin {
-            Origin::File { path, .. } => path.extension().and_then(|s| s.to_str()),
-            Origin::Archive { path, .. } => path.extension(),
+        match self {
+            Self::File { path, .. } => path.extension().and_then(|s| s.to_str()),
+            Self::Archive { path, .. } => path.extension(),
         }
     }
 
     /// Dump source information.
     pub(crate) fn dump(&self, o: &mut Out<'_>, archives: &Archives) -> Result<()> {
-        match &self.origin {
-            Origin::File {
+        match self {
+            Self::File {
                 path,
                 absolute_path,
             } => {
                 o.blank_link("file", shell::path(path), Some(absolute_path))?;
             }
-            Origin::Archive { archive, path } => {
+            Self::Archive { archive, path } => {
                 let archive = archives.get(*archive)?;
                 o.blank_link(
                     archive.kind,
@@ -563,9 +555,9 @@ impl Source {
 
     /// Get the file path if the source is a regular file.
     pub(crate) fn as_file(&self) -> Option<&Path> {
-        match &self.origin {
-            Origin::File { path, .. } => Some(path),
-            Origin::Archive { .. } => None,
+        match self {
+            Self::File { path, .. } => Some(path),
+            Self::Archive { .. } => None,
         }
     }
 }
