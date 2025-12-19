@@ -8,7 +8,7 @@ use lofty::file::{FileType, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue, TagItem};
 
-use crate::config::{Archives, Source};
+use crate::config::{Archives, Origin, Source};
 use crate::out::{Out, blank, info};
 
 pub(crate) struct Parts {
@@ -28,17 +28,18 @@ impl Parts {
         errors: &mut Vec<String>,
         tag_items: Option<&mut Vec<TagItem>>,
     ) -> Result<Self> {
-        let file: TaggedFile = if source.origin.is_file() {
-            lofty::read_from_path(&source.path)?
-        } else {
-            let contents = archives.contents(source)?;
-            let mut probe = Probe::new(Cursor::new(contents));
+        let file: TaggedFile = match &source.origin {
+            Origin::File { path } => lofty::read_from_path(path)?,
+            Origin::Archive { archive, path } => {
+                let contents = archives.contents(*archive, path)?;
+                let mut probe = Probe::new(Cursor::new(contents));
 
-            if let Some(file_type) = source.ext().and_then(FileType::from_ext) {
-                probe = probe.set_file_type(file_type);
+                if let Some(file_type) = source.ext().and_then(FileType::from_ext) {
+                    probe = probe.set_file_type(file_type);
+                }
+
+                probe.read()?
             }
-
-            probe.read()?
         };
 
         let tag = file.primary_tag().context("missing primary tag")?;

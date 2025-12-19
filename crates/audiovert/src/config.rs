@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use relative_path::{RelativePath, RelativePathBuf};
+use relative_path::{Component, RelativePath, RelativePathBuf};
 
 use crate::archive::Archive;
 use crate::bitrates::Bitrates;
@@ -47,8 +47,20 @@ impl Config {
         let mut to_formats = BTreeSet::new();
         let mut sources = Vec::new();
 
-        for path in &self.paths {
-            for f in ignore::Walk::new(path) {
+        for walk_path in &self.paths {
+            let dir = if walk_path.is_file() {
+                let Some(dir) = walk_path.parent() else {
+                    // This only happens for empty arguments, so they should
+                    // subsequently be ignored.
+                    continue;
+                };
+
+                dir
+            } else {
+                walk_path
+            };
+
+            for f in ignore::Walk::new(walk_path) {
                 let entry = f?;
 
                 let walked = entry.path();
@@ -80,11 +92,11 @@ impl Config {
                         let ok = 'ok: {
                             for c in path.components() {
                                 match c {
-                                    relative_path::Component::CurDir => {}
-                                    relative_path::Component::ParentDir => {
+                                    Component::CurDir => {}
+                                    Component::ParentDir => {
                                         break 'ok false;
                                     }
-                                    relative_path::Component::Normal(s) => {
+                                    Component::Normal(s) => {
                                         buf.push(s);
                                     }
                                 }
@@ -99,7 +111,6 @@ impl Config {
                                     archive: archive_id,
                                     path: path.to_owned(),
                                 },
-                                path: buf.to_path_buf(),
                             });
                         }
 
@@ -107,8 +118,9 @@ impl Config {
                     })?;
                 } else {
                     let source = Source {
-                        origin: Origin::File,
-                        path: walked.to_path_buf(),
+                        origin: Origin::File {
+                            path: walked.to_path_buf(),
+                        },
                     };
 
                     sources.push(source);
@@ -192,17 +204,7 @@ impl Config {
                                 }
                                 None => {
                                     let mut to_path = to_dir.clone();
-
-                                    let Ok(suffix) = source.path.strip_prefix(path) else {
-                                        tasks.errors.push(PathError {
-                                            source: source.clone(),
-                                            messages: vec![format!("failed to get path suffix")],
-                                        });
-
-                                        continue;
-                                    };
-
-                                    to_path.push(suffix);
+                                    source.to_dir_path(dir, &tasks.archives, &mut to_path)?;
                                     to_path.set_extension(to.ext());
                                     to_path
                                 }
@@ -210,20 +212,20 @@ impl Config {
                         } else {
                             match &id_parts {
                                 Some(id_parts) => {
-                                    let mut to_path = path.to_path_buf();
+                                    let mut to_path = dir.to_path_buf();
                                     id_parts.append_to(&mut to_path);
                                     to_path.add_extension(to.ext());
                                     to_path
                                 }
                                 None => {
-                                    let mut to_path = source.path.to_path_buf();
+                                    let mut to_path = source.to_path(&tasks.archives)?;
                                     to_path.set_extension(to.ext());
                                     to_path
                                 }
                             }
                         };
 
-                        if source.path == to_path {
+                        if source.as_file().is_some_and(|p| p == to_path) {
                             continue;
                         }
 
@@ -241,14 +243,15 @@ impl Config {
 
                         let kind = if from == to && !self.forced_bitrates.contains(&from) {
                             TaskKind::Transfer {
-                                kind: if source.origin.is_file() {
-                                    if self.r#move {
-                                        TransferKind::Move
-                                    } else {
-                                        TransferKind::Link
+                                kind: match &source.origin {
+                                    Origin::File { .. } => {
+                                        if self.r#move {
+                                            TransferKind::Move
+                                        } else {
+                                            TransferKind::Link
+                                        }
                                     }
-                                } else {
-                                    TransferKind::Copy
+                                    Origin::Archive { .. } => TransferKind::Copy,
                                 },
                             }
                         } else {
@@ -343,7 +346,7 @@ impl ArchiveOrigin {
 #[derive(Clone)]
 pub(crate) enum Origin {
     /// A regular file in the filesystem.
-    File,
+    File { path: PathBuf },
     /// A file inside an archive.
     Archive {
         /// Archive identifier.
@@ -351,14 +354,6 @@ pub(crate) enum Origin {
         /// Path inside the archive.
         path: RelativePathBuf,
     },
-}
-
-impl Origin {
-    /// Check if the origin is a regular file.
-    #[inline]
-    pub(crate) fn is_file(&self) -> bool {
-        matches!(self, Origin::File)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -401,17 +396,12 @@ impl Archives {
     }
 
     /// Get the contents of the source file.
-    pub(crate) fn contents(&self, source: &Source) -> Result<Vec<u8>> {
-        match &source.origin {
-            Origin::File => Ok(fs::read(&source.path)?),
-            Origin::Archive { archive, path } => {
-                let Some(archive) = self.archives.get(archive.0) else {
-                    anyhow::bail!("invalid archive id: {archive}");
-                };
+    pub(crate) fn contents(&self, archive: ArchiveId, path: &RelativePath) -> Result<Vec<u8>> {
+        let Some(archive) = self.archives.get(archive.0) else {
+            anyhow::bail!("invalid archive id: {archive}");
+        };
 
-                archive.contents(path)
-            }
-        }
+        archive.contents(path)
     }
 }
 
@@ -419,29 +409,107 @@ impl Archives {
 #[derive(Clone)]
 pub(crate) struct Source {
     pub(crate) origin: Origin,
-    pub(crate) path: PathBuf,
 }
 
 impl Source {
+    /// Append the relative source path to the given path.
+    pub(crate) fn to_dir_path(
+        &self,
+        base: &Path,
+        archives: &Archives,
+        to_path: &mut PathBuf,
+    ) -> Result<()> {
+        match &self.origin {
+            Origin::File { path } => {
+                let Ok(suffix) = path.strip_prefix(base) else {
+                    bail!("invalid base path");
+                };
+
+                to_path.push(suffix);
+            }
+            Origin::Archive { archive, path } => {
+                let archive = archives.get(*archive).context("no archive directory")?;
+
+                let Ok(suffix) = archive.path.strip_prefix(base) else {
+                    bail!("invalid base path");
+                };
+
+                if let Some(parent) = suffix.parent() {
+                    to_path.push(parent);
+                }
+
+                if let Some(file_stem) = archive.path.file_stem() {
+                    to_path.push(file_stem);
+                }
+
+                for c in path.components() {
+                    match c {
+                        Component::CurDir => {}
+                        Component::ParentDir => {
+                            panic!("invalid path in archive: {path}");
+                        }
+                        Component::Normal(s) => {
+                            to_path.push(s);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert an in-place source path to a regular filesystem path.
+    pub(crate) fn to_path(&self, archives: &Archives) -> Result<PathBuf> {
+        match &self.origin {
+            Origin::File { path } => Ok(path.clone()),
+            Origin::Archive { archive, path } => {
+                let archive = archives.get(*archive).context("no archive directory")?;
+
+                let mut to_path = archive.path.to_owned();
+
+                to_path.pop();
+
+                if let Some(stem) = archive.path.file_stem() {
+                    to_path.push(stem);
+                }
+
+                for c in path.components() {
+                    match c {
+                        Component::CurDir => {}
+                        Component::ParentDir => {
+                            panic!("invalid path in archive: {path}");
+                        }
+                        Component::Normal(s) => {
+                            to_path.push(s);
+                        }
+                    }
+                }
+
+                Ok(to_path)
+            }
+        }
+    }
+
     pub(crate) fn move_to(&self, archives: &Archives, to: &Path, kind: TransferKind) -> Result<()> {
         match &self.origin {
-            Origin::Archive { .. } => match kind {
+            Origin::Archive { archive, path } => match kind {
                 TransferKind::Link => bail!("cannot link from archive"),
                 TransferKind::Move => bail!("cannot move from archive"),
                 TransferKind::Copy => {
-                    let contents = archives.contents(self)?;
+                    let contents = archives.contents(*archive, path)?;
                     fs::write(to, contents).context("writing file")?;
                 }
             },
-            Origin::File => match kind {
+            Origin::File { path } => match kind {
                 TransferKind::Link => {
-                    fs::hard_link(&self.path, to).context("creating hard link")?;
+                    fs::hard_link(path, to).context("creating hard link")?;
                 }
                 TransferKind::Move => {
-                    fs::rename(&self.path, to).context("moving file")?;
+                    fs::rename(path, to).context("moving file")?;
                 }
                 TransferKind::Copy => {
-                    fs::copy(&self.path, to).context("copying file")?;
+                    fs::copy(path, to).context("copying file")?;
                 }
             },
         }
@@ -451,22 +519,38 @@ impl Source {
 
     /// Get the extension of the source file.
     pub(crate) fn ext(&self) -> Option<&str> {
-        self.path.extension().and_then(|s| s.to_str())
+        match &self.origin {
+            Origin::File { path } => path.extension().and_then(|s| s.to_str()),
+            Origin::Archive { path, .. } => path.extension(),
+        }
     }
 
     /// Dump source information.
     pub(crate) fn dump(&self, o: &mut Out<'_>, archives: &Archives) -> Result<()> {
-        if let Origin::Archive { archive, .. } = &self.origin {
-            let archive = archives.get(*archive)?;
-            blank!(
-                o,
-                "{}: {}",
-                archive.kind,
-                shell::escape(archive.path.as_os_str())
-            );
+        match &self.origin {
+            Origin::File { path } => {
+                blank!(o, "file: {}", shell::escape(path.as_os_str()));
+            }
+            Origin::Archive { archive, path } => {
+                let archive = archives.get(*archive)?;
+                blank!(
+                    o,
+                    "{}: {} ({})",
+                    archive.kind,
+                    shell::escape(archive.path.as_os_str()),
+                    path.as_str(),
+                );
+            }
         }
 
-        blank!(o, "path: {}", shell::escape(self.path.as_os_str()));
         Ok(())
+    }
+
+    /// Get the file path if the source is a regular file.
+    pub(crate) fn as_file(&self) -> Option<&Path> {
+        match &self.origin {
+            Origin::File { path } => Some(path),
+            Origin::Archive { .. } => None,
+        }
     }
 }

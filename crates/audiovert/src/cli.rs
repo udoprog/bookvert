@@ -10,11 +10,12 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::{self, Context, Result, bail};
 use clap::Parser;
+use relative_path::RelativePath;
 use termcolor::{ColorChoice, StandardStream};
 
 use crate::bitrates::Bitrates;
 use crate::condition::{Condition, FromCondition, ToCondition};
-use crate::config::{Archives, Config, Origin, Source};
+use crate::config::{ArchiveId, Archives, Config, Origin};
 use crate::format::Format;
 use crate::out::{Colors, Out, blank, error, info, warn};
 use crate::set_bit_rate::SetBitRate;
@@ -270,7 +271,12 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
             continue;
         }
 
-        info!(o, "Task #{}/#{total}: {}", c.index, c.kind);
+        info!(
+            o,
+            "Task #{}/#{total}: {}",
+            c.index.saturating_add(1),
+            c.kind
+        );
         let mut o = o.indent(1);
 
         c.source.dump(&mut o, &tasks.archives)?;
@@ -301,9 +307,11 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                 ..
             } => {
                 if !*converted {
-                    let (argument, pipe) = match &c.source.origin {
-                        Origin::File => (c.source.path.as_os_str(), false),
-                        Origin::Archive { .. } => (OsStr::new("pipe:"), true),
+                    let (argument, archive) = match &c.source.origin {
+                        Origin::File { path } => (path.as_os_str(), None),
+                        Origin::Archive { archive, path } => {
+                            (OsStr::new("pipe:"), Some((*archive, path)))
+                        }
                     };
 
                     let mut command = Command::new(&config.ffmpeg);
@@ -319,7 +327,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                     if !config.verbose {
                         f.replace(config.ffmpeg.as_os_str(), "<ffmpeg>");
 
-                        if !pipe {
+                        if archive.is_none() {
                             f.replace(argument, "<from>");
                         }
 
@@ -335,13 +343,14 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                         let mut o = o.indent(1);
 
                         if !config.dry_run {
-                            if pipe {
+                            if let Some((archive, path)) = archive {
                                 command.stdin(Stdio::piped());
 
                                 let status = match write_source_to_stdin(
                                     &mut command,
                                     &tasks.archives,
-                                    &c.source,
+                                    archive,
+                                    path,
                                 ) {
                                     Ok(status) => status,
                                     Err(e) => {
@@ -438,13 +447,14 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
             continue;
         }
 
-        if !c.source.origin.is_file() {
-            continue;
-        }
+        let path = match &c.source.origin {
+            Origin::Archive { .. } => continue,
+            Origin::File { path } => path,
+        };
 
         let new;
 
-        let file_name = match c.source.path.file_name() {
+        let file_name = match path.file_name() {
             Some(name) => name,
             None => {
                 new = OsString::from(format!("file{}", n));
@@ -455,7 +465,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
 
         tasks.to_trash.push(Trash {
             what: TrashWhat::SourceFile,
-            path: c.source.path.clone(),
+            path: path.clone(),
             name: file_name.to_owned(),
         });
     }
@@ -532,11 +542,12 @@ fn is_empty_dir(path: &PathBuf) -> bool {
 fn write_source_to_stdin(
     command: &mut Command,
     archives: &Archives,
-    source: &Source,
+    archive: ArchiveId,
+    path: &RelativePath,
 ) -> Result<ExitStatus> {
     let mut child = command.spawn().context("spawning process")?;
     let contents = archives
-        .contents(source)
+        .contents(archive, path)
         .context("reading source contents")?;
     let mut stdin = child.stdin.take().context("missing stdin")?;
     stdin.write_all(&contents).context("writing to stdin")?;
