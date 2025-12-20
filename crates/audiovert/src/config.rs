@@ -26,14 +26,15 @@ pub(crate) struct Config {
     pub(crate) dry_run: bool,
     pub(crate) ffmpeg: PathBuf,
     pub(crate) force: bool,
+    pub(crate) forced_bitrates: HashSet<Format>,
     pub(crate) keep_going: bool,
     pub(crate) meta_dump_error: bool,
     pub(crate) meta_dump: bool,
+    pub(crate) meta_internal: bool,
     pub(crate) meta: bool,
     pub(crate) part_ext: String,
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) r#move: bool,
-    pub(crate) forced_bitrates: HashSet<Format>,
     pub(crate) to_dir: Option<PathBuf>,
     pub(crate) trash_source: bool,
     pub(crate) trash: PathBuf,
@@ -44,7 +45,6 @@ impl Config {
     /// Populate tasks based on configuration.
     pub(crate) fn populate(&self, tasks: &mut Tasks) -> Result<()> {
         let mut meta_errors = Vec::new();
-        let mut meta_items = Vec::new();
         let mut to_formats = BTreeSet::new();
         let mut sources = Vec::new();
         let mut pre_remove = Vec::new();
@@ -146,17 +146,12 @@ impl Config {
                         });
                     }
 
-                    debug_assert!(meta_items.is_empty());
+                    let mut meta = None;
 
-                    let id_parts = meta::Parts::from_path(
-                        &source,
-                        &tasks.db,
-                        &mut meta_errors,
-                        &mut meta_items,
-                    )?;
+                    let id_parts =
+                        meta::Parts::from_path(&source, &tasks.db, &mut meta_errors, &mut meta)?;
 
-                    if !meta_items.is_empty() {
-                        let meta = meta_items.drain(..).collect();
+                    if let Some(meta) = meta {
                         tasks.meta.insert(source.clone(), meta);
                     }
 
@@ -263,6 +258,7 @@ impl Config {
                                 from,
                                 to,
                                 converted: exists,
+                                tagged: false,
                             }
                         };
 

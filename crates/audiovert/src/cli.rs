@@ -80,6 +80,9 @@ pub struct Audiovert {
     /// If set, dumps metadata for each file processed with `--meta`.
     #[arg(long)]
     meta_dump: bool,
+    /// If set, uses internal metadata writer based on lofty instead of ffmpeg.
+    #[arg(long)]
+    meta_internal: bool,
     /// If set, dumps metadata for each file processed with `--meta` that has
     /// errors.
     #[arg(long)]
@@ -170,14 +173,15 @@ pub fn entry(opts: &Audiovert) -> Result<()> {
         dry_run: opts.dry_run,
         ffmpeg: opts.ffmpeg_bin.clone(),
         force: opts.force,
+        forced_bitrates,
         keep_going: opts.keep_going,
         meta_dump_error: opts.meta_dump_error,
         meta_dump: opts.meta_dump,
+        meta_internal: opts.meta_internal,
         meta: opts.meta,
         part_ext: opts.part_ext.clone(),
         paths: opts.paths.clone(),
         r#move: opts.r#move,
-        forced_bitrates,
         to_dir: opts.to.clone(),
         trash_source: opts.trash_source,
         trash,
@@ -322,6 +326,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                 ref part_path,
                 to,
                 ref mut converted,
+                ref mut tagged,
                 ..
             } => {
                 if !*converted {
@@ -338,8 +343,12 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                     let mut command = Command::new(&config.ffmpeg);
                     command.args(["-hide_banner", "-loglevel", "error"]);
                     command.args([OsStr::new("-i"), argument]);
+
+                    if !config.meta_internal {
+                        command.args(["-map_metadata", "0"]);
+                    }
+
                     to.bitrate(config, &mut command);
-                    command.args(["-map_metadata", "0", "-id3v2_version", "3"]);
                     command.args(["-f", to.ffmpeg_format()]);
                     command.arg(part_path);
 
@@ -395,9 +404,32 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                         } else {
                             *converted = true;
                         }
+
+                        if !config.meta_internal {
+                            *tagged = true;
+                        }
                     }
 
-                    if *converted && !c.moved {
+                    if !*tagged {
+                        if let Some(meta) = tasks.meta.get(&c.source) {
+                            blank!(o, "tag <to>.{} ({} tags)", config.part_ext, meta.len());
+
+                            if !config.dry_run {
+                                if let Err(e) = meta.tag_file(to, part_path) {
+                                    error!(o, "{e}");
+                                } else {
+                                    *tagged = true;
+                                }
+                            } else {
+                                *tagged = true;
+                            }
+                        } else {
+                            blank!(o, "tag <to>.{} (no tags)", config.part_ext);
+                            *tagged = true;
+                        }
+                    }
+
+                    if *converted && *tagged && !c.moved {
                         if !config.make_dir(&mut o, "rename", &c.to_path)? {
                             continue;
                         }

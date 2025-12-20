@@ -2,15 +2,17 @@ use core::str::FromStr;
 
 use std::borrow::Cow;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use jiff::civil::Date;
-use lofty::file::{FileType, TaggedFile, TaggedFileExt};
+use lofty::config::WriteOptions;
+use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
-use lofty::tag::{ItemKey, ItemValue, TagItem};
+use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 
 use crate::config::{Db, Source};
+use crate::format::Format;
 use crate::out::{Out, blank, info};
 
 pub(crate) struct Parts {
@@ -28,7 +30,7 @@ impl Parts {
         source: &Source,
         db: &Db,
         errors: &mut Vec<String>,
-        items: &mut Vec<TagItem>,
+        tagged: &mut Option<Meta>,
     ) -> Result<Option<Self>> {
         let file: TaggedFile = match source {
             Source::File { file } => {
@@ -47,7 +49,9 @@ impl Parts {
             }
         };
 
-        let Some(tag) = file.primary_tag() else {
+        let meta = tagged.get_or_insert(Meta { file });
+
+        let Some(tag) = meta.file.primary_tag() else {
             errors.push("missing primary tag".to_string());
             return Ok(None);
         };
@@ -89,8 +93,6 @@ impl Parts {
                 $(let mut $name = Prio::new();)*
 
                 for item in tag.items() {
-                    items.push(item.clone());
-
                     let value = item.value();
 
                     match item.key() {
@@ -319,28 +321,67 @@ fn sanitize(s: &str) -> Cow<'_, str> {
 }
 
 pub(super) struct Meta {
-    pub(super) items: Vec<TagItem>,
+    pub(super) file: TaggedFile,
 }
 
 impl Meta {
+    /// Get the total number of tags.
+    pub(crate) fn len(&self) -> u32 {
+        self.file.tags().iter().map(|tag| tag.item_count()).sum()
+    }
+
+    /// Dump tags to output.
     pub(crate) fn dump(&self, o: &mut Out<'_>) -> Result<()> {
-        for item in &self.items {
-            dump_tag_item(o, item)?;
+        for tag in self.file.tags() {
+            info!(o, "tag: {}", repr_tag_type(tag.tag_type()));
+            let mut o = o.indent(1);
+
+            for item in tag.items() {
+                dump_tag_item(&mut o, item)?;
+            }
         }
 
         Ok(())
     }
-}
 
-impl FromIterator<TagItem> for Meta {
-    #[inline]
-    fn from_iter<T>(iter: T) -> Self
-    where
-        T: IntoIterator<Item = TagItem>,
-    {
-        Self {
-            items: iter.into_iter().collect(),
-        }
+    pub(crate) fn tag_file(&self, to: Format, path: &Path) -> Result<()> {
+        // First try to copy tags immediately.
+        let Some(source_tag) = self.file.primary_tag() else {
+            return Ok(());
+        };
+
+        let mut probe = Probe::open(path)?;
+        probe = probe.set_file_type(format_file_type(to));
+
+        let mut existing = probe.read()?;
+
+        let tag_type = existing.primary_tag_type();
+
+        existing.clear();
+
+        'done: {
+            // Primary method: try to insert the primary tag directly if it is
+            // identical to the source tag type.
+            if source_tag.tag_type() == tag_type {
+                existing.insert_tag(source_tag.clone());
+                break 'done;
+            }
+
+            // Fallback: copy items one by one, which will cause unsupported
+            // tags to be skipped.
+            let mut tag = Tag::new(tag_type);
+
+            for item in source_tag.items() {
+                tag.insert(item.clone());
+            }
+
+            existing.insert_tag(tag);
+        };
+
+        let mut options = WriteOptions::default();
+        options.use_id3v23(true);
+        existing.save_to_path(path, options)?;
+        Ok(())
     }
 }
 
@@ -361,4 +402,27 @@ fn dump_tag_item(o: &mut Out<'_>, item: &TagItem) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn format_file_type(format: Format) -> FileType {
+    match format {
+        Format::Aac => FileType::Aac,
+        Format::Flac => FileType::Flac,
+        Format::Mp3 => FileType::Mpeg,
+        Format::Ogg => FileType::Vorbis,
+        Format::Wav => FileType::Wav,
+    }
+}
+
+fn repr_tag_type(ty: TagType) -> &'static str {
+    match ty {
+        TagType::Ape => "APE",
+        TagType::Id3v1 => "ID3v1",
+        TagType::Id3v2 => "ID3v2",
+        TagType::Mp4Ilst => "MP4 ilst",
+        TagType::VorbisComments => "Vorbis Comments",
+        TagType::RiffInfo => "RIFF INFO",
+        TagType::AiffText => "AIFF TEXT",
+        _ => "Unknown",
+    }
 }

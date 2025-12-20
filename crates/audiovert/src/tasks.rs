@@ -67,10 +67,16 @@ impl fmt::Display for TransferKind {
 pub(crate) enum TaskKind {
     /// Convert from one format to another.
     Convert {
+        /// Path of a partially converted file.
         part_path: MaybeLink,
+        /// Format to convert from.
         from: Format,
+        /// Format to convert to.
         to: Format,
+        /// Whether conversion has been done.
         converted: bool,
+        /// Whether metadata tagging has been done.
+        tagged: bool,
     },
     /// Transfer from source to destination.
     Transfer {
