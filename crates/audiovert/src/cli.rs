@@ -15,7 +15,7 @@ use termcolor::{ColorChoice, StandardStream};
 
 use crate::bitrates::Bitrates;
 use crate::condition::{Condition, FromCondition, ToCondition};
-use crate::config::{ArchiveId, Archives, Config, Source};
+use crate::config::{ArchiveId, Config, Db, Source};
 use crate::format::Format;
 use crate::link::MaybeLink;
 use crate::out::{Colors, Out, blank, error, info, warn};
@@ -216,14 +216,14 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
     for Unsupported { source, ext } in tasks.unsupported.drain(..) {
         warn!(o, "Unsupported extension: {ext}");
         let mut o = o.indent(1);
-        source.dump(&mut o, &tasks.archives)?;
+        tasks.db.dump(&mut o, &source)?;
     }
 
     if config.verbose {
         for Exists { source, path } in tasks.already_exists.drain(..) {
             warn!(o, "already exists (--force to remove):");
             let mut o = o.indent(1);
-            source.dump(&mut o, &tasks.archives)?;
+            tasks.db.dump(&mut o, &source)?;
             o.link("to", &path)?;
         }
     }
@@ -231,7 +231,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
     for e in &tasks.errors {
         error!(o, "Error:");
         let mut o = o.indent(1);
-        e.source.dump(&mut o, &tasks.archives)?;
+        tasks.db.dump(&mut o, &e.source)?;
 
         for m in &e.messages {
             error!(o, "{m}");
@@ -239,7 +239,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
     }
 
     for d in &tasks.meta_dumps {
-        d.dump(o, &tasks.archives)?;
+        d.dump(o, &tasks.db)?;
     }
 
     if !tasks.errors.is_empty() && !config.keep_going {
@@ -261,7 +261,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
 
             info!(o, "Found matching conversions: {from} -> {to_formats}");
             let mut o = o.indent(1);
-            source.dump(&mut o, &tasks.archives)?;
+            tasks.db.dump(&mut o, &source)?;
         }
     }
 
@@ -280,7 +280,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
         );
         let mut o = o.indent(1);
 
-        c.source.dump(&mut o, &tasks.archives)?;
+        tasks.db.dump(&mut o, &c.source)?;
         o.link("to", &c.to_path)?;
 
         for (reason, path) in c.pre_remove.drain(..) {
@@ -309,7 +309,10 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
             } => {
                 if !*converted {
                     let (argument, archive) = match &c.source {
-                        Source::File { path, .. } => (path.as_os_str(), None),
+                        Source::File { file } => {
+                            let file = tasks.db.file(*file)?;
+                            (file.as_os_str(), None)
+                        }
                         Source::Archive { archive, path } => {
                             (OsStr::new("pipe:"), Some((*archive, path)))
                         }
@@ -349,7 +352,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
 
                                 let status = match write_source_to_stdin(
                                     &mut command,
-                                    &tasks.archives,
+                                    &tasks.db,
                                     archive,
                                     path,
                                 ) {
@@ -409,14 +412,14 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
                     }
 
                     if config.verbose {
-                        c.source.dump(&mut o, &tasks.archives)?;
+                        tasks.db.dump(&mut o, &c.source)?;
                         o.link("to", &c.to_path)?;
                     } else {
                         blank!(o, "{} <from> <to>", kind.symbolic_command());
                     }
 
                     if !config.dry_run {
-                        let result = c.source.move_to(&tasks.archives, &c.to_path, kind);
+                        let result = tasks.db.move_to(&c.source, &c.to_path, kind);
 
                         if let Err(e) = result {
                             error!(o, "{e}");
@@ -450,7 +453,7 @@ fn run(o: &mut Out<'_>, config: &Config) -> Result<()> {
 
         let path = match &c.source {
             Source::Archive { .. } => continue,
-            Source::File { path, .. } => path,
+            Source::File { file } => tasks.db.file(*file)?,
         };
 
         let new;
@@ -542,13 +545,13 @@ fn is_empty_dir(path: &PathBuf) -> bool {
 
 fn write_source_to_stdin(
     command: &mut Command,
-    archives: &Archives,
+    archives: &Db,
     archive: ArchiveId,
     path: &RelativePath,
 ) -> Result<ExitStatus> {
     let mut child = command.spawn().context("spawning process")?;
     let contents = archives
-        .contents(archive, path)
+        .archive_contents(archive, path)
         .context("reading source contents")?;
     let mut stdin = child.stdin.take().context("missing stdin")?;
     stdin.write_all(&contents).context("writing to stdin")?;

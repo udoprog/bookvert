@@ -8,7 +8,7 @@ use lofty::file::{FileType, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue, TagItem};
 
-use crate::config::{Archives, Source};
+use crate::config::{Db, Source};
 use crate::out::{Out, blank, info};
 
 pub(crate) struct Parts {
@@ -24,17 +24,20 @@ pub(crate) struct Parts {
 impl Parts {
     pub(crate) fn from_path(
         source: &Source,
-        archives: &Archives,
+        db: &Db,
         errors: &mut Vec<String>,
         tag_items: Option<&mut Vec<TagItem>>,
     ) -> Result<Self> {
         let file: TaggedFile = match source {
-            Source::File { path, .. } => lofty::read_from_path(path)?,
+            Source::File { file } => {
+                let path = db.file(*file)?;
+                lofty::read_from_path(path)?
+            }
             Source::Archive { archive, path } => {
-                let contents = archives.contents(*archive, path)?;
+                let contents = db.archive_contents(*archive, path)?;
                 let mut probe = Probe::new(Cursor::new(contents));
 
-                if let Some(file_type) = source.ext().and_then(FileType::from_ext) {
+                if let Some(file_type) = db.ext(source)?.and_then(FileType::from_ext) {
                     probe = probe.set_file_type(file_type);
                 }
 
@@ -293,11 +296,11 @@ pub(super) struct Dump {
 }
 
 impl Dump {
-    pub(crate) fn dump(&self, o: &mut Out<'_>, archives: &Archives) -> Result<()> {
+    pub(crate) fn dump(&self, o: &mut Out<'_>, db: &Db) -> Result<()> {
         info!(o, "Tags:");
         let mut o = o.indent(1);
 
-        self.source.dump(&mut o, archives)?;
+        db.dump(&mut o, &self.source)?;
 
         for item in &self.items {
             dump_tag_item(&mut o, item)?;

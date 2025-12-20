@@ -2,7 +2,7 @@ use core::fmt;
 
 use std::ffi::OsString;
 
-use crate::config::{Archives, Source};
+use crate::config::{Db, Source};
 use crate::format::Format;
 use crate::link::{Link, MaybeLink};
 use crate::meta::Dump;
@@ -15,7 +15,7 @@ pub(crate) struct Tasks {
     pub(crate) to_trash: Vec<Trash>,
     pub(crate) already_exists: Vec<Exists>,
     pub(crate) unsupported: Vec<Unsupported>,
-    pub(crate) archives: Archives,
+    pub(crate) db: Db,
 }
 
 impl Tasks {
@@ -28,7 +28,7 @@ impl Tasks {
             to_trash: Vec::new(),
             already_exists: Vec::new(),
             unsupported: Vec::new(),
-            archives: Archives::new(),
+            db: Db::new(),
         }
     }
 }
