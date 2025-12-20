@@ -1,8 +1,10 @@
+use core::str::FromStr;
+
 use std::borrow::Cow;
 use std::io::Cursor;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use jiff::civil::Date;
 use lofty::file::{FileType, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
@@ -26,7 +28,7 @@ impl Parts {
         source: &Source,
         db: &Db,
         errors: &mut Vec<String>,
-        tag_items: &mut Vec<TagItem>,
+        items: &mut Vec<TagItem>,
     ) -> Result<Option<Self>> {
         let file: TaggedFile = match source {
             Source::File { file } => {
@@ -45,126 +47,154 @@ impl Parts {
             }
         };
 
-        let tag = file.primary_tag().context("missing primary tag")?;
+        let Some(tag) = file.primary_tag() else {
+            errors.push("missing primary tag".to_string());
+            return Ok(None);
+        };
 
-        for item in tag.items() {
-            tag_items.push(item.clone());
+        /// A priority container.
+        struct Prio<T> {
+            /// Current value.
+            value: Option<T>,
+            /// Priority of the current value. Lower is better.
+            prio: u32,
         }
 
-        macro_rules! get_str {
-            ($id:ident) => {{
-                let tag = tag.get(&ItemKey::$id);
-                tag.and_then(|item| item.value().text())
-            }};
-        }
-
-        macro_rules! get {
-            ($id:ident) => {{ get_str!($id).and_then(|s| s.parse().ok()) }};
-        }
-
-        let year: Option<i16> = 'year: {
-            fn parse_year(s: &str) -> Option<i16> {
-                let s = s.trim();
-
-                if let Ok(date) = s.parse::<Date>() {
-                    return Some(date.year());
+        impl<T> Prio<T> {
+            fn new() -> Self {
+                Self {
+                    value: None,
+                    prio: u32::MAX,
                 }
-
-                if let Ok(year) = s.parse::<i16>() {
-                    return Some(year);
-                }
-
-                None
             }
 
-            if let Some(d) = get_str!(OriginalReleaseDate).and_then(parse_year) {
-                break 'year Some(d);
-            };
+            fn update(&mut self, new: Option<T>, prio: u32) {
+                if let Some(new) = new
+                    && prio < self.prio
+                {
+                    self.value = Some(new);
+                    self.prio = prio;
+                }
+            }
+        }
 
-            if let Some(d) = get_str!(ReleaseDate).and_then(parse_year) {
-                break 'year Some(d);
-            };
+        macro_rules! parse {
+            (
+                $(
+                    $name:ident = $parse:ident {
+                        $($key:ident = $priority:expr),* $(,)?
+                    }
+                ),* $(,)?
+            ) => {
+                $(let mut $name = Prio::new();)*
 
-            if let Some(d) = get_str!(Year).and_then(parse_year) {
-                break 'year Some(d);
-            };
+                for item in tag.items() {
+                    items.push(item.clone());
 
-            if let Some(d) = get_str!(RecordingDate).and_then(parse_year) {
-                break 'year Some(d);
-            };
+                    let value = item.value();
 
-            errors.push("missing year".to_string());
+                    match item.key() {
+                        $($(ItemKey::$key =>  {
+                            $name.update($parse(value), $priority);
+                        })*)*
+                        _ => {},
+                    };
+                }
+            };
+        }
+
+        parse! {
+            year = year_like {
+                OriginalReleaseDate = 1,
+                ReleaseDate = 2,
+                Year = 3,
+                RecordingDate = 4,
+            },
+            album = text {
+                AlbumTitle = 1,
+            },
+            artist = text {
+                AlbumArtist = 1,
+                TrackArtist = 2,
+            },
+            title = text {
+                TrackTitle = 1,
+            },
+            track = parse {
+                TrackNumber = 1,
+            },
+            media_type = text {
+                OriginalMediaType = 1,
+            },
+            disc_number = parse {
+                DiscNumber = 1,
+            },
+            disc_total = parse {
+                DiscTotal = 1,
+            },
+        }
+
+        fn text(value: &ItemValue) -> Option<&str> {
+            let s = value.text()?.trim();
+            (!s.is_empty()).then_some(s)
+        }
+
+        fn year_like(value: &ItemValue) -> Option<i16> {
+            let s = value.text()?;
+            let s = s.trim();
+
+            if let Ok(date) = s.parse::<Date>() {
+                return Some(date.year());
+            }
+
+            if let Ok(year) = s.parse::<i16>() {
+                return Some(year);
+            }
+
             None
-        };
+        }
 
-        let album = 'album: {
-            if let Some(album) = get_str!(AlbumTitle) {
-                break 'album Some(album.trim());
+        fn parse<T>(value: &ItemValue) -> Option<T>
+        where
+            T: FromStr,
+        {
+            let s = value.text()?;
+            T::from_str(s).ok()
+        }
+
+        let mut value = || {
+            if year.value.is_none() {
+                errors.push("missing year".to_string());
+            }
+
+            if album.value.is_none() {
+                errors.push("missing album".to_string());
+            }
+
+            if artist.value.is_none() {
+                errors.push("missing artist".to_string());
+            }
+
+            if title.value.is_none() {
+                errors.push("missing title".to_string());
+            }
+
+            if track.value.is_none() {
+                errors.push("missing track number".to_string());
+            }
+
+            let set = match (disc_number.value, disc_total.value) {
+                (Some(n), Some(total)) => Some((n, total)),
+                _ => None,
             };
 
-            errors.push("missing album".to_string());
-            None
-        };
-
-        let artist = 'artist: {
-            if let Some(artist) = get_str!(AlbumArtist) {
-                break 'artist Some(artist.trim());
-            };
-
-            if let Some(artist) = get_str!(TrackArtist) {
-                break 'artist Some(artist.trim());
-            };
-
-            errors.push("missing artist".to_string());
-            None
-        };
-
-        let title = 'title: {
-            if let Some(title) = get_str!(TrackTitle) {
-                break 'title Some(title.trim());
-            };
-
-            errors.push("missing title".to_string());
-            None
-        };
-
-        let track = 'track: {
-            if let Some(track) = get!(TrackNumber) {
-                break 'track Some(track);
-            };
-
-            errors.push("missing track".to_string());
-            None
-        };
-
-        let media_type = 'media_type: {
-            if let Some(value) = get_str!(OriginalMediaType) {
-                break 'media_type Some(value.trim());
-            };
-
-            None
-        };
-
-        let set = 'set: {
-            let Some(number) = get!(DiscNumber) else {
-                break 'set None;
-            };
-
-            let Some(total) = get!(DiscTotal) else {
-                break 'set None;
-            };
-
-            Some((number, total))
-        };
-
-        let value = || {
             Some(Self {
-                year: year?,
-                artist: artist?.trim().to_owned(),
-                album: album?.to_owned(),
-                track: track?,
-                title: title?.trim().to_owned(),
-                media_type: media_type.map(str::to_owned),
+                year: year.value?,
+                artist: artist.value?.to_owned(),
+                album: album.value?.to_owned(),
+                track: track.value?,
+                title: title.value?.to_owned(),
+                media_type: media_type.value.map(str::to_owned),
                 set,
             })
         };

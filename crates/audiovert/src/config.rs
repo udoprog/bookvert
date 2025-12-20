@@ -43,8 +43,8 @@ pub(crate) struct Config {
 impl Config {
     /// Populate tasks based on configuration.
     pub(crate) fn populate(&self, tasks: &mut Tasks) -> Result<()> {
-        let mut tag_errors = Vec::new();
-        let mut tag_items = Vec::new();
+        let mut meta_errors = Vec::new();
+        let mut meta_items = Vec::new();
         let mut to_formats = BTreeSet::new();
         let mut sources = Vec::new();
         let mut pre_remove = Vec::new();
@@ -146,32 +146,33 @@ impl Config {
                         });
                     }
 
-                    debug_assert!(tag_items.is_empty());
+                    debug_assert!(meta_items.is_empty());
 
                     let id_parts = meta::Parts::from_path(
                         &source,
                         &tasks.db,
-                        &mut tag_errors,
-                        &mut tag_items,
+                        &mut meta_errors,
+                        &mut meta_items,
                     )?;
 
-                    if !tag_items.is_empty() {
-                        let meta = tag_items.drain(..).collect();
+                    if !meta_items.is_empty() {
+                        let meta = meta_items.drain(..).collect();
                         tasks.meta.insert(source.clone(), meta);
                     }
 
                     let meta_parts = if self.meta {
                         let Some(id_parts) = id_parts else {
-                            tag_errors.push(format!(
+                            meta_errors.push(
                                 "could not extract required tags (see --meta-dump-error)"
-                            ));
+                                    .to_string(),
+                            );
                             continue;
                         };
 
-                        if !tag_errors.is_empty() {
+                        if !meta_errors.is_empty() {
                             tasks.errors.push(PathError {
                                 source: source.clone(),
-                                messages: tag_errors.drain(..).collect(),
+                                messages: meta_errors.drain(..).collect(),
                             });
                         }
 
